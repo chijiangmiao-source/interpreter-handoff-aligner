@@ -1,15 +1,35 @@
 import { parseLocated } from "./jsonLocations";
-import type { AlignResponse, Anchor, ApiError, TermPair } from "./types";
+import type {
+  AlignResponse,
+  Anchor,
+  ApiError,
+  AuditResponse,
+  TermPair,
+} from "./types";
 
 export class AlignRequestError extends Error {
   path: string;
   status: number;
+  /**
+   * Present only on a /api/audit semantic mismatch: the value the current
+   * rules expect at `path` and the value the candidate actually carries.
+   */
+  expected?: unknown;
+  actual?: unknown;
 
-  constructor(message: string, path: string, status: number) {
+  constructor(
+    message: string,
+    path: string,
+    status: number,
+    expected?: unknown,
+    actual?: unknown,
+  ) {
     super(message);
     this.name = "AlignRequestError";
     this.path = path;
     this.status = status;
+    if (expected !== undefined) this.expected = expected;
+    if (actual !== undefined) this.actual = actual;
   }
 }
 
@@ -130,4 +150,100 @@ export async function alignNotes(
     };
   }
   return result;
+}
+
+/**
+ * POST the two raw JSON array texts plus a raw candidate object to the audit
+ * API. The candidate source is forwarded VERBATIM (like the two note arrays)
+ * so hand-written timestamps beyond Number.MAX_SAFE_INTEGER keep their exact
+ * digits; re-serializing through JSON.stringify would throw on bigint or
+ * silently round.
+ *
+ * Anchors/term pairs use the same optional fragments as /api/align and are
+ * omitted entirely when absent, so an anchor/term-free audit request carries
+ * only left, right and candidate.
+ *
+ * A structurally malformed candidate rejects with an AlignRequestError
+ * carrying the one error path (e.g. `candidate.steps[2].cost`). A
+ * well-formed candidate that disagrees with the inputs or the cost rules
+ * rejects the same way and additionally carries `expected`/`actual` for the
+ * first differing step so the workspace can localize and explain that row.
+ */
+export async function auditNotes(
+  leftRawArray: string,
+  rightRawArray: string,
+  candidateRawObject: string,
+  fetchImpl: typeof fetch = fetch,
+  anchors?: Anchor[],
+  termPairs?: TermPair[],
+): Promise<AuditResponse> {
+  const anchorsFragment =
+    anchors === undefined ? "" : `,"anchors":${JSON.stringify(anchors)}`;
+  const termsFragment =
+    termPairs === undefined ? "" : `,"term_pairs":${JSON.stringify(termPairs)}`;
+  const body =
+    `{"left":${leftRawArray},"right":${rightRawArray}` +
+    `${anchorsFragment}${termsFragment},"candidate":${candidateRawObject}}`;
+
+  let resp: Response;
+  try {
+    resp = await fetchImpl("/api/audit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+  } catch {
+    throw new AlignRequestError(
+      "无法连接核验服务，请确认 API 已启动。",
+      "",
+      0,
+    );
+  }
+
+  const text = await resp.text();
+  let parsed: unknown;
+  try {
+    parsed = parseLocated(text).value;
+  } catch {
+    throw new AlignRequestError(
+      `服务返回了无法解析的响应（HTTP ${resp.status}）。`,
+      "",
+      resp.status,
+    );
+  }
+
+  if (!resp.ok) {
+    const data = parsed as Partial<ApiError> & {
+      expected?: unknown;
+      actual?: unknown;
+    };
+    throw new AlignRequestError(
+      typeof data?.error === "string"
+        ? data.error
+        : `请求失败（HTTP ${resp.status}）。`,
+      typeof data?.path === "string" ? data.path : "",
+      resp.status,
+      data?.expected,
+      data?.actual,
+    );
+  }
+
+  const outcome = parsed as AuditResponse;
+  // The located parser turns every integer literal into a bigint; the audit's
+  // row indices and echoed anchors are small integers, so normalize them back
+  // to plain numbers (a blank side stays null).
+  if (Array.isArray(outcome.anchors)) {
+    outcome.anchors = outcome.anchors.map((a) => ({
+      left: Number(a.left),
+      right: Number(a.right),
+    }));
+  }
+  for (const detail of outcome.steps) {
+    detail.index = Number(detail.index);
+    detail.consumed = {
+      left: detail.consumed.left === null ? null : Number(detail.consumed.left),
+      right: detail.consumed.right === null ? null : Number(detail.consumed.right),
+    };
+  }
+  return outcome;
 }

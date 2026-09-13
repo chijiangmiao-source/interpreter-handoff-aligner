@@ -83,3 +83,31 @@ export interface ApiError {
   error: string;
   path: string;
 }
+
+/**
+ * One row of the server's row-by-row audit recomputation. The candidate passed
+ * verification, so every actual value equals the value recomputed under the
+ * current rules; `consumed` carries the original-note indices the row uses
+ * (null on the side that is blank).
+ */
+export interface AuditStepDetail {
+  index: number;
+  action: Action;
+  expected_cost: Int;
+  actual_cost: Int;
+  expected_cumulative_cost: Int;
+  actual_cumulative_cost: Int;
+  consumed: { left: number | null; right: number | null };
+  basis: string;
+  origin?: RowOrigin | null;
+  expected_term_pair?: TermPair | null;
+}
+
+export interface AuditResponse {
+  ok: true;
+  total_cost: Int;
+  counts: { match: number; left_gap: number; right_gap: number };
+  consumed: { left: number; right: number };
+  anchors?: Anchor[];
+  steps: AuditStepDetail[];
+}

@@ -583,6 +583,190 @@ def run_term_pair_checks() -> None:
     )
 
 
+def run_audit_checks(left, right, free_body) -> None:
+    """Acceptance for the independent candidate-verification workspace."""
+    base = {"left": left, "right": right}
+    candidate = {"steps": free_body["steps"], "total_cost": free_body["total_cost"]}
+
+    # Guarantee 1: a legal candidate (here the golden result itself) passes and
+    # the response carries the row-by-row recomputation details.
+    status, body = http(
+        "POST", f"{API_URL}/api/audit", {**base, "candidate": candidate}
+    )
+    check(
+        "audit: legal candidate passes with row-by-row recomputation",
+        status == 200
+        and body.get("ok") is True
+        and body["total_cost"] == 4250
+        and [d["expected_cost"] for d in body["steps"]] == [150, 100, 2000, 2000]
+        and [d["expected_cumulative_cost"] for d in body["steps"]]
+        == [150, 250, 2250, 4250]
+        and [d["consumed"] for d in body["steps"]]
+        == [
+            {"left": 0, "right": 0},
+            {"left": 1, "right": 1},
+            {"left": 2, "right": None},
+            {"left": None, "right": 2},
+        ]
+        and all(
+            d["expected_cost"] == d["actual_cost"]
+            and d["expected_cumulative_cost"] == d["actual_cumulative_cost"]
+            for d in body["steps"]
+        ),
+        f"body={body}",
+    )
+
+    # Guarantee 2: a missing original note is localized at the end path with
+    # the expected note and actual null (single semantic-difference envelope).
+    kept = [dict(s) for s in free_body["steps"] if s["action"] != "left_gap"]
+    cumulative = 0
+    for s in kept:
+        cumulative += s["cost"]
+        s["cumulative_cost"] = cumulative
+    status, body = http(
+        "POST", f"{API_URL}/api/audit",
+        {**base, "candidate": {"steps": kept, "total_cost": cumulative}},
+    )
+    check(
+        "audit: omitted note localized at candidate.steps[3] with values",
+        status == 422
+        and set(body) == {"error", "path", "expected", "actual"}
+        and body["path"] == "candidate.steps[3]"
+        and body["expected"] == {"time": 12000, "text": "交接后的补充记录"}
+        and body["actual"] is None,
+        f"body={body}",
+    )
+
+    # A repeated note is localized on the row that reuses it.
+    repeated = {"steps": [dict(s) for s in free_body["steps"]],
+                "total_cost": free_body["total_cost"]}
+    repeated["steps"].insert(3, dict(free_body["steps"][2]))
+    status, body = http(
+        "POST", f"{API_URL}/api/audit", {**base, "candidate": repeated}
+    )
+    check(
+        "audit: duplicated note localized at candidate.steps[3].left",
+        status == 422
+        and body["path"] == "candidate.steps[3].left"
+        and "left[2]" in body["actual"]
+        and "重复" in body["error"],
+        f"body={body}",
+    )
+
+    # Guarantee 3: a wrong single-step cost is rejected with both values.
+    bad_cost = {"steps": [dict(s) for s in free_body["steps"]],
+                "total_cost": free_body["total_cost"]}
+    bad_cost["steps"][2]["cost"] = 9999
+    status, body = http(
+        "POST", f"{API_URL}/api/audit", {**base, "candidate": bad_cost}
+    )
+    check(
+        "audit: wrong single-step cost rejected (expected/actual)",
+        status == 422
+        and body["path"] == "candidate.steps[2].cost"
+        and body["expected"] == 2000
+        and body["actual"] == 9999,
+        f"body={body}",
+    )
+
+    # Guarantee 4: structural errors keep the ordinary single-error envelope.
+    status, body = http(
+        "POST", f"{API_URL}/api/audit",
+        {**base, "candidate": {"steps": [{"action": "fly"}], "total_cost": 0}},
+    )
+    check(
+        "audit: malformed candidate keeps the single-error envelope",
+        status == 422
+        and set(body) == {"error", "path"}
+        and body["path"] == "candidate.steps[0].action",
+        f"body={body}",
+    )
+    status, body = http("POST", f"{API_URL}/api/audit", base)
+    check(
+        "audit: missing candidate fails once at `candidate`",
+        status == 422 and body["path"] == "candidate" and len(body) == 2,
+        f"body={body}",
+    )
+    # Existing input errors still take precedence and use the same envelope.
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/audit",
+        {
+            "left": [{"time": 1, "text": "a"}, {"time": 1, "text": "b"}],
+            "right": [],
+            "candidate": {"steps": [], "total_cost": 0},
+        },
+    )
+    check(
+        "audit: input validation precedes the candidate check",
+        status == 422 and body["path"] == "left[1].time" and len(body) == 2,
+        f"body={body}",
+    )
+
+    # Guarantee 5: a candidate with anchors AND term pairs recomputes fully.
+    a_left = [
+        {"time": 0, "text": "g"}, {"time": 4200, "text": "p"},
+        {"time": 9000, "text": "t"},
+    ]
+    a_right = [
+        {"time": 150, "text": "G"}, {"time": 4100, "text": "P"},
+        {"time": 12000, "text": "h"},
+    ]
+    anchors = [{"left": 0, "right": 0}]
+    terms = [
+        {"left_text": "g", "right_text": "G"},
+        {"left_text": "p", "right_text": "P"},
+    ]
+    status, aligned = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {"left": a_left, "right": a_right, "anchors": anchors, "term_pairs": terms},
+    )
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/audit",
+        {
+            "left": a_left,
+            "right": a_right,
+            "anchors": anchors,
+            "term_pairs": terms,
+            "candidate": {
+                "steps": aligned["steps"],
+                "total_cost": aligned["total_cost"],
+            },
+        },
+    )
+    first = body["steps"][0] if status == 200 and body.get("steps") else {}
+    check(
+        "audit: anchors + term pairs recompute completely (anchor/term/cost)",
+        status == 200
+        and body.get("ok") is True
+        and body["anchors"] == anchors
+        and first.get("origin") == "anchor"
+        and first.get("expected_term_pair") == {"left_text": "g", "right_text": "G"}
+        and first.get("expected_cost") == 150
+        and "免除 3000" in first.get("basis", ""),
+        f"body={body}",
+    )
+
+    # Guarantee 6: /api/align is untouched by the new endpoint.
+    status, again = http("POST", f"{API_URL}/api/align", base)
+    check(
+        "audit: /api/align request/response stays exactly as before",
+        status == 200 and again == free_body and "candidate" not in again,
+    )
+
+    # The web container proxies the new route same-origin too.
+    status, body = http(
+        "POST", f"{WEB_URL}/api/audit", {**base, "candidate": candidate}
+    )
+    check(
+        "audit: web /api proxy serves /api/audit",
+        status == 200 and body.get("ok") is True and body["total_cost"] == 4250,
+        f"status={status} body={body}",
+    )
+
+
 def main() -> int:
     # 1. API health
     status, body = http("GET", f"{API_URL}/health")
@@ -849,6 +1033,9 @@ def main() -> int:
 
     # 10. Lead-declared term correspondences (synonym pairs).
     run_term_pair_checks()
+
+    # 11. Independent candidate-verification workspace (/api/audit).
+    run_audit_checks(left, right, first)
 
     print(f"\n{checks - len(failures)}/{checks} checks passed.")
     if failures:

@@ -1,11 +1,17 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import AnchorPanel, { type PickerNote } from "./AnchorPanel";
 import TermPairPanel from "./TermPairPanel";
 import HighlightedTextarea from "./HighlightedTextarea";
 import ResultTimeline from "./ResultTimeline";
-import { alignNotes, rootRawText, AlignRequestError } from "./api";
+import AuditPanel, { type AuditPanelError } from "./AuditPanel";
+import { alignNotes, auditNotes, rootRawText, AlignRequestError } from "./api";
 import { validateAnchors, type AnchorIssue } from "./anchors";
 import { validateTermPairs, type TermPairIssue } from "./termPairs";
+import {
+  stepIndexFromPath,
+  toCandidateRows,
+  validateCandidate,
+} from "./candidate";
 import {
   JsonSourceError,
   locateOffset,
@@ -13,7 +19,13 @@ import {
   type Range,
 } from "./jsonLocations";
 import { validateSequence } from "./validation";
-import type { AlignResponse, Anchor, TermPair, Int } from "./types";
+import type {
+  AlignResponse,
+  Anchor,
+  AuditResponse,
+  TermPair,
+  Int,
+} from "./types";
 
 type Side = "left" | "right";
 
@@ -65,6 +77,19 @@ function termIndexFromPath(path: string): number {
   return match ? Number(match[1]) : -1;
 }
 
+/** JSON serialization that keeps bigint integers as raw numeric literals. */
+function stringifyBigJson(value: unknown): string {
+  // JSON.stringify's replacer cannot emit raw numbers for bigints, so swap
+  // each bigint for a unique object marker and splice its exact digits back
+  // in afterwards. The marker key cannot collide: in the serialized candidate
+  // it appears as an object, while the only user-controlled content lives in
+  // string values (whose embedded quotes are escaped as \").
+  const text = JSON.stringify(value, (_key, v) =>
+    typeof v === "bigint" ? { __bigint_literal__: v.toString() } : v,
+  );
+  return text.replace(/\{"__bigint_literal__":"(-?\d+)"\}/g, "$1");
+}
+
 export default function App() {
   const [leftText, setLeftText] = useState(SAMPLE_LEFT);
   const [rightText, setRightText] = useState(SAMPLE_RIGHT);
@@ -90,6 +115,16 @@ export default function App() {
   // added; a same-side duplicate mapping is flagged on the first conflict
   // instead of silently dropped, mirroring the anchor crossing UX.
   const [termPairs, setTermPairs] = useState<TermPair[]>([]);
+  // Independent "核验时间轴" workspace: the pasted candidate text is ALWAYS
+  // retained; auditResult holds only the LAST PASSING report, so a failed
+  // verification surfaces the first difference without replacing it.
+  const [auditText, setAuditText] = useState("");
+  const [auditError, setAuditError] = useState<AuditPanelError | null>(null);
+  const [auditResult, setAuditResult] = useState<AuditResponse | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
+  // Bumped by every audit submission so a late response for a superseded
+  // candidate never overwrites the current workspace state.
+  const auditSeq = useRef(0);
   // Bumped by every input/anchor mutation. A submission captures the current
   // generation and only applies its response while no mutation has happened
   // since, so a late response never resurrects a timeline computed from
@@ -106,6 +141,21 @@ export default function App() {
     };
     return { left: parse(leftText), right: parse(rightText) };
   }, [leftText, rightText]);
+
+  // The pasted candidate: parse keeps source ranges (to highlight the first
+  // structural-error path in the textarea) and the rows for the preview list.
+  const auditLocated = useMemo(() => {
+    if (auditText.trim().length === 0) return null;
+    try {
+      return parseLocated(auditText);
+    } catch {
+      return null;
+    }
+  }, [auditText]);
+  const auditRows = useMemo(
+    () => (auditLocated ? toCandidateRows(auditLocated.value) : []),
+    [auditLocated],
+  );
 
   // Picker lists follow whatever currently parses; malformed items still get
   // a row (with “—” placeholders) so their index is visible.
@@ -439,6 +489,207 @@ export default function App() {
     });
   }
 
+  // A passing audit report is only valid for the inputs it verified: any
+  // change to the notes, anchors or term pairs retires it (the pasted
+  // candidate itself is always retained). The in-flight generation is bumped
+  // too, so a late audit response for superseded inputs is ignored.
+  const anchorsKey = JSON.stringify(anchors);
+  const termsKey = JSON.stringify(termPairs);
+  useEffect(() => {
+    auditSeq.current += 1;
+    setAuditResult(null);
+    setAuditError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leftText, rightText, anchorsKey, termsKey]);
+
+  /** Source range of the audited candidate's first error, for highlighting. */
+  function auditMarker(): Range | null {
+    if (!auditError) return null;
+    if (auditError.offset !== undefined) {
+      const len = auditText.length;
+      return { start: auditError.offset, end: Math.min(auditError.offset + 1, len) };
+    }
+    if (!auditLocated || !auditError.path.startsWith("candidate")) return null;
+    const rel = auditError.path.slice("candidate".length);
+    if (rel === "") return auditLocated.ranges.get("") ?? null;
+    // Try the member (key:value), then the value range, then progressively
+    // strip the trailing field so a step-level path highlights its whole row.
+    let cur = rel;
+    while (cur.length > 0) {
+      const found =
+        auditLocated.memberRanges.get(cur) ?? auditLocated.ranges.get(cur);
+      if (found) return found;
+      const dot = cur.lastIndexOf(".");
+      const bracket = cur.lastIndexOf("[");
+      const cut = Math.max(dot, bracket);
+      if (cut <= 0) break;
+      cur = cur.slice(0, cut);
+    }
+    return auditLocated.ranges.get("") ?? null;
+  }
+
+  function failAuditJson(e: unknown) {
+    const pos = e instanceof JsonSourceError ? e.pos : 0;
+    const { line, column } = locateOffset(auditText, pos);
+    const reason = e instanceof Error ? e.message : "非法 JSON。";
+    setAuditError({
+      message: `第 ${line} 行第 ${column} 列无法解析：${reason}`,
+      path: "",
+      stepIndex: -1,
+      offset: pos,
+    });
+  }
+
+  /**
+   * Verify the pasted candidate against the CURRENT notes, anchors and term
+   * pairs. The pasted text is never cleared or replaced: on failure the first
+   * differing candidate row is localized (source highlight + preview row) and
+   * the last PASSING report is intentionally left untouched.
+   */
+  async function handleAuditSubmit() {
+    setAuditError(null);
+    setAuditLoading(true);
+    const generation = ++auditSeq.current;
+    const isCurrent = () => generation === auditSeq.current;
+    try {
+      // Phase 1: the pasted candidate must itself parse as JSON.
+      let auditParsed: ReturnType<typeof parseLocated>;
+      try {
+        auditParsed = parseLocated(auditText);
+      } catch (e) {
+        failAuditJson(e);
+        return;
+      }
+
+      // Phase 2: the notes/anchors/terms the candidate is verified against
+      // must be valid (mirrors the align flow; the server stays authoritative).
+      if (!located.left) {
+        setAuditError({
+          message: "左侧笔记不是合法 JSON，请先在上方修正后再核验。",
+          path: "left",
+          stepIndex: -1,
+        });
+        return;
+      }
+      if (!located.right) {
+        setAuditError({
+          message: "右侧笔记不是合法 JSON，请先在上方修正后再核验。",
+          path: "right",
+          stepIndex: -1,
+        });
+        return;
+      }
+      const localLeft = validateSequence(located.left.value);
+      if (localLeft) {
+        setAuditError({
+          message: localLeft.message,
+          path: `left${localLeft.path}`,
+          stepIndex: -1,
+        });
+        return;
+      }
+      const localRight = validateSequence(located.right.value);
+      if (localRight) {
+        setAuditError({
+          message: localRight.message,
+          path: `right${localRight.path}`,
+          stepIndex: -1,
+        });
+        return;
+      }
+      const m = (located.left.value as unknown[]).length;
+      const n = (located.right.value as unknown[]).length;
+      const anchorIssue = validateAnchors(anchors, m, n);
+      if (anchorIssue) {
+        setAuditError({
+          message: anchorIssue.message,
+          path: anchorIssue.path,
+          stepIndex: -1,
+        });
+        return;
+      }
+      const termIssue = validateTermPairs(termPairs);
+      if (termIssue) {
+        setAuditError({
+          message: termIssue.message,
+          path: termIssue.path,
+          stepIndex: -1,
+        });
+        return;
+      }
+
+      // Phase 2b: the candidate structure (actions, slots, costs, provenance).
+      const candidateIssue = validateCandidate(auditParsed.value);
+      if (candidateIssue) {
+        setAuditError({
+          message: candidateIssue.message,
+          path: candidateIssue.path,
+          stepIndex: candidateIssue.stepIndex,
+        });
+        return;
+      }
+
+      // Phase 3: the server replays the candidate under the current rules.
+      const candidateRaw = rootRawText(auditText);
+      const anchorsToSend = anchors.length > 0 ? anchors : undefined;
+      const termsToSend = termPairs.length > 0 ? termPairs : undefined;
+      try {
+        const outcome = await auditNotes(
+          rootRawText(leftText),
+          rootRawText(rightText),
+          candidateRaw,
+          fetch,
+          anchorsToSend,
+          termsToSend,
+        );
+        if (!isCurrent()) return;
+        setAuditResult(outcome);
+      } catch (e) {
+        if (!isCurrent()) return;
+        if (e instanceof AlignRequestError) {
+          setAuditError({
+            message: e.message,
+            path: e.path,
+            stepIndex: stepIndexFromPath(e.path),
+            expected: e.expected,
+            actual: e.actual,
+          });
+        } else {
+          setAuditError({
+            message: "发生未知错误，请稍后重试。",
+            path: "",
+            stepIndex: -1,
+          });
+        }
+      }
+    } finally {
+      setAuditLoading(false);
+    }
+  }
+
+  /** Prefill the candidate box from the current optimal timeline. */
+  function fillAuditFromResult() {
+    if (!result) return;
+    auditSeq.current += 1;
+    const candidate = {
+      steps: result.steps.map((s) => {
+        const row: Record<string, unknown> = {
+          action: s.action,
+          left: s.left,
+          right: s.right,
+          cost: s.cost,
+          cumulative_cost: s.cumulative_cost,
+        };
+        if (s.origin) row.origin = s.origin;
+        if (s.term_pair) row.term_pair = s.term_pair;
+        return row;
+      }),
+      total_cost: result.total_cost,
+    };
+    setAuditText(stringifyBigJson(candidate));
+    setAuditError(null);
+  }
+
   function loadSample() {
     submitSeq.current += 1;
     setLeftText(SAMPLE_LEFT);
@@ -617,6 +868,24 @@ export default function App() {
       {visibleResult && (
         <ResultTimeline result={visibleResult} runningTotal={runningTotal} />
       )}
+
+      <AuditPanel
+        value={auditText}
+        onChange={(v) => {
+          auditSeq.current += 1;
+          setAuditText(v);
+          setAuditError(null);
+        }}
+        marker={auditMarker()}
+        invalid={!!auditError}
+        rows={auditRows}
+        error={auditError}
+        loading={auditLoading}
+        result={auditResult}
+        onSubmit={handleAuditSubmit}
+        onFillFromResult={fillAuditFromResult}
+        canFillFromResult={!!result}
+      />
     </main>
   );
 }
