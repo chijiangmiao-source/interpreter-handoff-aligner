@@ -199,22 +199,28 @@ export default function App() {
    * Declare a term pair. The candidate is always kept in the list; when it
    * maps a side term already mapped (same-side duplicate), the first
    * conflicting pair is flagged in place instead of silently dropping it.
+   *
+   * Declaring terms is a pre-submission edit, like typing in the term panel:
+   * it never replaces an already displayed timeline. A conflict only blocks
+   * the next submission (with a banner); the last valid timeline stays on
+   * screen until a successful realignment replaces it. The generation counter
+   * still bumps, so a response in flight is recognized as computed from the
+   * pre-edit declarations and never applied on top of them.
    */
   function addTermPair(candidate: TermPair) {
     submitSeq.current += 1;
     const tentative = [...termPairs, candidate];
     setTermPairs(tentative);
     applyTermIssue(validateTermPairs(tentative));
-    setResult(null);
   }
 
   function removeTermPair(index: number) {
     submitSeq.current += 1;
     const remaining = termPairs.filter((_, k) => k !== index);
     setTermPairs(remaining);
-    // Re-flag the first remaining conflict, if any; otherwise clear it.
+    // Re-flag the first remaining conflict, if any; otherwise clear it. The
+    // displayed timeline is left untouched (pre-submission edit).
     applyTermIssue(validateTermPairs(remaining));
-    setResult(null);
   }
 
   /** Anchor-picker click: complete a pair, toggle a pending pick, or unpin. */
@@ -257,11 +263,14 @@ export default function App() {
 
   async function handleSubmit() {
     setError(null);
-    setResult(null);
     setLoading(true);
-    // Generation this submission belongs to. Any edit to the inputs or the
-    // anchors before the response returns bumps the counter, marking this
-    // in-flight request stale: its late response must not be displayed.
+    // Generation this submission belongs to. Any edit to the inputs, anchors
+    // or term pairs before the response returns bumps the counter, marking
+    // this in-flight request stale: its late response must not be displayed.
+    // The previous timeline is NOT cleared here: a submission blocked by a
+    // local problem (bad JSON, a crossing anchor, a term conflict) leaves
+    // the last valid timeline on screen and only surfaces the one error. It
+    // is replaced once a recomputation is actually launched below.
     const generation = ++submitSeq.current;
     const isCurrent = () => generation === submitSeq.current;
     try {
@@ -330,10 +339,17 @@ export default function App() {
       }
 
       // --- Phase 3: the server performs the DP alignment ------------------
-      // The raw array source is forwarded verbatim so integer literals
-      // beyond Number.MAX_SAFE_INTEGER keep their exact digits. Anchors are
-      // only sent when at least one is confirmed, keeping anchor-free
-      // requests and responses byte-for-byte identical to the legacy API.
+      // Every local check passed, so this is a genuine recomputation: the
+      // previous timeline is cleared now (a blocked submission above keeps
+      // it on screen). The raw array source is forwarded verbatim so
+      // integer literals beyond Number.MAX_SAFE_INTEGER keep their exact
+      // digits. Anchors/term pairs are only sent when non-empty, keeping
+      // anchor/term-free requests byte-for-byte identical to the legacy API.
+      setResult(null);
+      // Remember the last valid timeline so a term conflict reported by the
+      // server (normally already caught by the mirrored local check) can
+      // restore it rather than leaving the page without any timeline.
+      const lastResult = result;
       const leftRaw = rootRawText(leftText);
       const rightRaw = rootRawText(rightText);
       const anchorsToSend = anchors.length > 0 ? anchors : undefined;
@@ -373,7 +389,10 @@ export default function App() {
             });
           } else if (termIndex >= 0 || e.path === "term_pairs") {
             // Term-pair failure: keep notes, anchors and every declared
-            // term, flag the single conflicting pair, show no new timeline.
+            // term, flag the single conflicting pair, and keep the last
+            // valid timeline on screen (a term conflict is a declaration
+            // problem, not a reason to discard the previously computed one).
+            if (lastResult) setResult(lastResult);
             setError({
               message: e.message,
               path: e.path,

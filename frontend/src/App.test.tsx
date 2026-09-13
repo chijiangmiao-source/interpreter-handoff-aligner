@@ -1153,4 +1153,89 @@ describe("App: term pairs", () => {
     );
     vi.unstubAllGlobals();
   });
+
+  it("keeps the last valid timeline when a conflicting term pair is added", async () => {
+    const fetchMock = mockFetchOnce(termBody);
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+    fireEvent.change(screen.getByTestId("input-left"), {
+      target: { value: JSON.stringify(termNotes.left) },
+    });
+    fireEvent.change(screen.getByTestId("input-right"), {
+      target: { value: JSON.stringify(termNotes.right) },
+    });
+    const add = (l: string, r: string) => {
+      fireEvent.change(screen.getByTestId("term-input-left"), {
+        target: { value: l },
+      });
+      fireEvent.change(screen.getByTestId("term-input-right"), {
+        target: { value: r },
+      });
+      fireEvent.click(screen.getByTestId("term-add"));
+    };
+    add("人工智能", "AI");
+    fireEvent.click(screen.getByTestId("submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("total-cost").textContent).toBe("300");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Adding a conflicting (duplicate left_text) pair after a valid timeline
+    // is shown must NOT replace the timeline: it stays on screen while the
+    // single conflict is flagged in the banner and beside the offending row.
+    add("人工智能", "机器学习");
+    expect(screen.getByTestId("result-panel")).toBeInTheDocument();
+    expect(screen.getAllByTestId("timeline-row")).toHaveLength(2);
+    expect(screen.getByTestId("total-cost").textContent).toBe("300");
+    expect(screen.getByTestId("error-path").textContent).toContain(
+      "term_pairs[1].left_text",
+    );
+    expect(screen.getAllByTestId("term-item")[1]).toHaveClass("invalid");
+
+    // Submitting while the conflict is present is blocked locally: no new
+    // request, and the previous timeline is still displayed.
+    fireEvent.click(screen.getByTestId("submit"));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("result-panel")).toBeInTheDocument();
+    expect(screen.getAllByTestId("timeline-row")).toHaveLength(2);
+
+    // Removing the offending pair clears the conflict while the (last valid)
+    // timeline remains on screen for the lead to read.
+    fireEvent.click(screen.getByTestId("term-remove-1"));
+    expect(screen.queryByTestId("error-banner")).toBeNull();
+    expect(screen.getByTestId("result-panel")).toBeInTheDocument();
+    expect(screen.getAllByTestId("timeline-row")).toHaveLength(2);
+    expect(screen.getAllByTestId("term-item")).toHaveLength(1);
+    vi.unstubAllGlobals();
+  });
+
+  it("adding a valid term pair before resubmitting also keeps the prior timeline", async () => {
+    vi.stubGlobal("fetch", mockFetchOnce(termBody));
+    render(<App />);
+    fireEvent.change(screen.getByTestId("input-left"), {
+      target: { value: JSON.stringify(termNotes.left) },
+    });
+    fireEvent.change(screen.getByTestId("input-right"), {
+      target: { value: JSON.stringify(termNotes.right) },
+    });
+    // A first run without any term pair shows a (mocked) timeline.
+    fireEvent.click(screen.getByTestId("submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    // Declaring an additional, non-conflicting correspondence is a
+    // pre-submission edit: it must not discard the displayed timeline.
+    fireEvent.change(screen.getByTestId("term-input-left"), {
+      target: { value: "机器学习" },
+    });
+    fireEvent.change(screen.getByTestId("term-input-right"), {
+      target: { value: "ML" },
+    });
+    fireEvent.click(screen.getByTestId("term-add"));
+    expect(screen.queryByTestId("error-banner")).toBeNull();
+    expect(screen.getByTestId("result-panel")).toBeInTheDocument();
+    expect(screen.getAllByTestId("term-item")).toHaveLength(1);
+    vi.unstubAllGlobals();
+  });
 });

@@ -671,6 +671,55 @@ test.describe("term pairs", () => {
     await page.getByTestId("term-remove-1").click();
     await expect(page.getByTestId("error-banner")).toHaveCount(0);
   });
+
+  test("a conflict added after a valid timeline keeps that timeline", async ({
+    page,
+  }) => {
+    const left = JSON.stringify([{ time: 0, text: "人工智能" }]);
+    const right = JSON.stringify([{ time: 100, text: "AI" }]);
+    await page.getByTestId("input-left").fill(left);
+    await page.getByTestId("input-right").fill(right);
+
+    const addPair = async (l: string, r: string) => {
+      await page.getByTestId("term-input-left").fill(l);
+      await page.getByTestId("term-input-right").fill(r);
+      await page.getByTestId("term-add").click();
+    };
+    await addPair("人工智能", "AI");
+    await page.getByTestId("submit").click();
+    await expect(page.getByTestId("result-panel")).toBeVisible();
+    await expect(page.getByTestId("total-cost")).toHaveText("100");
+
+    // After the valid timeline is shown, declaring a conflicting pair must
+    // keep that timeline on screen while flagging the single conflict.
+    await addPair("人工智能", "机器学习");
+    await expect(page.getByTestId("result-panel")).toBeVisible();
+    await expect(page.getByTestId("timeline-row")).toHaveCount(1);
+    await expect(page.getByTestId("total-cost")).toHaveText("100");
+    await expect(page.getByTestId("step-term")).toHaveText("术语等价");
+    await expect(page.getByTestId("error-path")).toContainText(
+      "term_pairs[1].left_text",
+    );
+
+    // Resubmitting while the conflict exists is blocked (single request sent)
+    // and the previous timeline survives.
+    const requests: string[] = [];
+    page.on("request", (req) => {
+      if (req.url().includes("/api/align")) requests.push(req.method());
+    });
+    await page.getByTestId("submit").click();
+    await expect(page.getByTestId("error-path")).toContainText(
+      "term_pairs[1].left_text",
+    );
+    expect(requests).toHaveLength(0);
+    await expect(page.getByTestId("result-panel")).toBeVisible();
+
+    // Deleting the conflict clears the banner while the timeline remains.
+    await page.getByTestId("term-remove-1").click();
+    await expect(page.getByTestId("error-banner")).toHaveCount(0);
+    await expect(page.getByTestId("result-panel")).toBeVisible();
+    await expect(page.getByTestId("total-cost")).toHaveText("100");
+  });
 });
 
 test("live API: term pairs waive the penalty only on exact hits and stay legacy-compatible", async ({
