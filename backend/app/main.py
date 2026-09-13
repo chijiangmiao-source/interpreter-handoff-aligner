@@ -4,8 +4,9 @@ The only business endpoint is ``POST /api/align`` accepting::
 
     {"left": [{"time": int, "text": str}, ...],
      "right": [{"time": int, "text": str}, ...],
-     "anchors": [{"left": int, "right": int}, ...],   # optional
-     "compare_alternative": bool}                      # optional
+     "anchors": [{"left": int, "right": int}, ...],     # optional
+     "term_pairs": [{"left_text": str, "right_text": str}, ...],  # optional
+     "compare_alternative": bool}                        # optional
 
 ``anchors`` is optional.  When present, each entry pins a human-confirmed
 pair of 0-based record indices; the service re-runs the same DP on the
@@ -13,6 +14,14 @@ intervals the anchors cut out.  Bad anchors (out of range, reused index,
 crossing/non-monotonic order) fail exactly once with a path such as
 ``anchors[1].left``.  Requests without ``anchors`` keep their historical
 behaviour and response shape exactly.
+
+``term_pairs`` is an optional list of lead-confirmed term correspondences.
+Only an exact (verbatim) hit of a declared pair waives the mismatch penalty
+for a pairing; the time difference, gap costs, anchor constraints, tie rules
+and alternative ranking are unchanged.  A term may be mapped once per side;
+the first conflicting entry fails exactly once with a path such as
+``term_pairs[1].right_text``.  Absent or empty, request computation and the
+response shape stay byte-for-byte identical to before.
 
 ``compare_alternative`` is an optional boolean (absent/false by default).
 When true the response additionally carries an ``alternative`` object with
@@ -38,7 +47,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .alignment import align
-from .validation import MAX_ITEMS, validate_anchors, validate_sequence
+from .validation import (
+    MAX_ITEMS,
+    validate_anchors,
+    validate_sequence,
+    validate_term_pairs,
+)
 
 app = FastAPI(title="Interpreter Handoff Aligner", version="1.0.0")
 
@@ -101,9 +115,21 @@ async def align_notes(request: Request) -> JSONResponse:
             return _failure(422, bad_message, bad_path)
         anchor_pairs = [(a["left"], a["right"]) for a in anchors_raw]
 
+    # Optional lead-declared term correspondences.  Like anchors they are
+    # examined only after the two sequences pass; absent or an explicitly
+    # empty list keeps the legacy computation and response exactly.
+    terms_given = "term_pairs" in payload
+    term_pairs_raw: list[dict[str, Any]] = []
+    if terms_given:
+        bad_path, bad_message = validate_term_pairs(payload["term_pairs"])
+        if bad_path is not None:
+            return _failure(422, bad_message, bad_path)
+        term_pairs_raw = payload["term_pairs"]
+
     # Optional switch for the strictly second-best complete path.  It is
-    # examined only after the notes/anchors pass (fixed check order) and must
-    # be a plain JSON boolean; absent or false it changes nothing at all.
+    # examined only after the notes/anchors/term pairs pass (fixed check
+    # order) and must be a plain JSON boolean; absent or false it changes
+    # nothing at all.
     compare_alternative = False
     if "compare_alternative" in payload:
         flag = payload["compare_alternative"]
@@ -120,6 +146,11 @@ async def align_notes(request: Request) -> JSONResponse:
         payload["right"],
         anchors=anchor_pairs if anchors_given else None,
         compare_alternative=compare_alternative,
+        term_pairs=(
+            [(p["left_text"], p["right_text"]) for p in term_pairs_raw]
+            if terms_given
+            else None
+        ),
     )
     return JSONResponse(result)
 

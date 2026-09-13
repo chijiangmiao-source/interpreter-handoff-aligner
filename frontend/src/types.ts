@@ -15,6 +15,15 @@ export interface Anchor {
 }
 
 /**
+ * A lead-declared term correspondence: a pairing whose two note texts equal
+ * these strings verbatim is treated as synonymous (mismatch penalty waived).
+ */
+export interface TermPair {
+  left_text: string;
+  right_text: string;
+}
+
+/**
  * Provenance of a result row, present only when the request carried anchors:
  * "anchor" marks a row the human confirmed, "auto" a DP-generated row.
  */
@@ -27,6 +36,11 @@ export interface AlignStep {
   cost: Int;
   cumulative_cost: Int;
   origin?: RowOrigin;
+  /**
+   * Present only on match rows whose two (different) texts are an exact hit
+   * of a declared term pair; carries the pair that waived the penalty.
+   */
+  term_pair?: TermPair;
 }
 
 /**
@@ -59,6 +73,8 @@ export interface AlignResponse {
   costs: { gap: number; mismatch_penalty: number };
   /** Echoed back only for anchored requests. */
   anchors?: Anchor[];
+  /** Echoed back only for requests carrying a non-empty term_pairs list. */
+  term_pairs?: TermPair[];
   /** Present only for compare_alternative requests; null when unique. */
   alternative?: AlternativeAlignment | null;
 }

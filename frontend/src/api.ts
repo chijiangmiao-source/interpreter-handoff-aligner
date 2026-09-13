@@ -1,5 +1,5 @@
 import { parseLocated } from "./jsonLocations";
-import type { AlignResponse, Anchor, ApiError } from "./types";
+import type { AlignResponse, Anchor, ApiError, TermPair } from "./types";
 
 export class AlignRequestError extends Error {
   path: string;
@@ -33,14 +33,18 @@ export function rootRawText(text: string): string {
  * - `anchors` are optional human-confirmed pairs of 0-based record indices;
  *   they are ordinary small integers, so safe to serialize with the normal
  *   JSON serializer (unlike the raw, possibly huge-integer array text);
+ * - `termPairs` are optional lead-declared text correspondences; they are
+ *   serialized with the normal JSON serializer and omitted entirely when
+ *   undefined, keeping term-free requests byte-for-byte identical to legacy;
  * - `compareAlternative` adds `compare_alternative: true`, asking the server
  *   for the strictly second-best complete path; it is omitted entirely when
  *   false/undefined, keeping the legacy request byte-for-byte identical;
  * - network/non-JSON-HTTP failures become a single AlignRequestError with an
  *   empty path;
  * - API 4xx failures become AlignRequestError carrying exactly one error path
- *   (e.g. `left[2].time` or `anchors[1].left`) so the UI can keep the text,
- *   keep the selected anchors, and mark that one spot.
+ *   (e.g. `left[2].time`, `anchors[1].left` or `term_pairs[0].left_text`) so
+ *   the UI can keep the text, keep the selected anchors and term rows, and
+ *   mark that one spot.
  *
  * The response is parsed with the BigInt-aware parser so huge integer
  * timestamps survive the round trip without precision loss.
@@ -51,16 +55,23 @@ export async function alignNotes(
   fetchImpl: typeof fetch = fetch,
   anchors?: Anchor[],
   compareAlternative = false,
+  termPairs?: TermPair[],
 ): Promise<AlignResponse> {
   // Anchors are omitted entirely for a legacy request; when present (even an
-  // empty list) they are spliced in after the raw arrays. The comparison
-  // flag is only sent when switched on, so false/undefined adds no bytes.
+  // empty list) they are spliced in after the raw arrays. Term pairs are
+  // likewise only spliced when the caller passes them (non-empty at the UI
+  // call site); the comparison flag is only sent when switched on, so
+  // false/undefined adds no bytes.
   const anchorsFragment =
     anchors === undefined ? "" : `,"anchors":${JSON.stringify(anchors)}`;
+  const termsFragment =
+    termPairs === undefined
+      ? ""
+      : `,"term_pairs":${JSON.stringify(termPairs)}`;
   const compareFragment = compareAlternative
     ? ',"compare_alternative":true'
     : "";
-  const body = `{"left":${leftRawArray},"right":${rightRawArray}${anchorsFragment}${compareFragment}}`;
+  const body = `{"left":${leftRawArray},"right":${rightRawArray}${anchorsFragment}${termsFragment}${compareFragment}}`;
 
   let resp: Response;
   try {

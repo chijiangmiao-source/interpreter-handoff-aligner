@@ -120,8 +120,7 @@ describe("alignNotes", () => {
     expect(bodies[1]).toBe(`{"left":[],"right":[],"anchors":[]}`);
   });
 
-  it("omits compare_alternative unless the option is true (legacy bytes)", async () => {
-    const bodies: string[] = [];
+  it("omits compare_alternative unless the option is true (legacy bytes)", async () => {    const bodies: string[] = [];
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       bodies.push(init!.body as string);
       return jsonResponse(alignedBody);
@@ -288,5 +287,110 @@ describe("alignNotes", () => {
     await expect(
       alignNotes("[]", "[]", fetchMock as unknown as typeof fetch),
     ).rejects.toBeInstanceOf(AlignRequestError);
+  });
+
+  it("omits term_pairs entirely when none are given (legacy body)", async () => {
+    const bodies: string[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      bodies.push(init!.body as string);
+      return jsonResponse(alignedBody);
+    });
+    const f = fetchMock as unknown as typeof fetch;
+    await alignNotes("[]", "[]", f);
+    expect(bodies[0]).toBe(`{"left":[],"right":[]}`);
+    expect(bodies[0]).not.toContain("term_pairs");
+    // Explicit undefined (with compare on) still adds no term_pairs.
+    await alignNotes("[]", "[]", f, undefined, true, undefined);
+    expect(bodies[1]).toBe(
+      `{"left":[],"right":[],"compare_alternative":true}`,
+    );
+  });
+
+  it("sends term_pairs between anchors and the compare flag", async () => {
+    let sentBody = "";
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      sentBody = init!.body as string;
+      return jsonResponse({
+        ...alignedBody,
+        term_pairs: [{ left_text: "a", right_text: "b" }],
+      });
+    });
+    await alignNotes(
+      `[{"time":1,"text":"a"}]`,
+      `[{"time":2,"text":"b"}]`,
+      fetchMock as unknown as typeof fetch,
+      [{ left: 0, right: 0 }],
+      true,
+      [{ left_text: "a", right_text: "b" }],
+    );
+    expect(sentBody).toBe(
+      `{"left":[{"time":1,"text":"a"}],"right":[{"time":2,"text":"b"}],` +
+        `"anchors":[{"left":0,"right":0}],` +
+        `"term_pairs":[{"left_text":"a","right_text":"b"}],` +
+        `"compare_alternative":true}`,
+    );
+  });
+
+  it("parses echoed term_pairs and per-row term_pair markers", async () => {
+    const body = {
+      steps: [
+        {
+          action: "match",
+          left: { time: 0, text: "人工智能" },
+          right: { time: 100, text: "AI" },
+          cost: 100,
+          cumulative_cost: 100,
+          term_pair: { left_text: "人工智能", right_text: "AI" },
+        },
+      ],
+      total_cost: 100,
+      counts: { match: 1, left_gap: 0, right_gap: 0 },
+      costs: { gap: 2000, mismatch_penalty: 3000 },
+      term_pairs: [{ left_text: "人工智能", right_text: "AI" }],
+    };
+    const result = await alignNotes(
+      "[]",
+      "[]",
+      vi.fn(async () => jsonResponse(body)) as unknown as typeof fetch,
+      undefined,
+      false,
+      [{ left_text: "人工智能", right_text: "AI" }],
+    );
+    expect(result.term_pairs).toEqual([
+      { left_text: "人工智能", right_text: "AI" },
+    ]);
+    expect(result.steps[0].term_pair).toEqual({
+      left_text: "人工智能",
+      right_text: "AI",
+    });
+    expect(result.steps[0].cost).toBe(100n);
+  });
+
+  it("surfaces a single term-pair conflict path on 422", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        {
+          error: "同一侧术语不可重复对应。",
+          path: "term_pairs[1].left_text",
+        },
+        422,
+      ),
+    );
+    await expect(
+      alignNotes(
+        "[]",
+        "[]",
+        fetchMock as unknown as typeof fetch,
+        undefined,
+        false,
+        [
+          { left_text: "a", right_text: "x" },
+          { left_text: "a", right_text: "y" },
+        ],
+      ),
+    ).rejects.toMatchObject({
+      path: "term_pairs[1].left_text",
+      status: 422,
+    });
   });
 });

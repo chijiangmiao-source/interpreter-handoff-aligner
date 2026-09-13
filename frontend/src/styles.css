@@ -14,6 +14,8 @@
   --rgap-bg: #f5f3ff;
   --danger: #b91c1c;
   --danger-bg: #fef2f2;
+  --term: #0e7490;
+  --term-bg: #ecfeff;
   --mark: #fde68a;
   --mark-border: #d97706;
 }
@@ -332,6 +334,117 @@ button.primary:hover:not(:disabled) {
   font-weight: 700;
 }
 
+/* ---- Lead-declared term correspondences -------------------------------- */
+
+.terms {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 18px;
+  margin: 18px 0;
+}
+
+.terms h2 {
+  margin: 0 0 6px;
+  font-size: 17px;
+}
+
+.terms h3 {
+  margin: 14px 0 6px;
+  font-size: 14px;
+}
+
+.term-hint {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 12px;
+}
+
+.term-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.term-input {
+  flex: 1 1 200px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.term-input:focus {
+  outline: none;
+  border-color: var(--term);
+  box-shadow: 0 0 0 3px var(--term-bg);
+}
+
+.term-link {
+  color: var(--muted);
+}
+
+.term-add {
+  padding: 8px 16px;
+}
+
+.term-empty {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0;
+}
+
+.term-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.term-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #f8fafc;
+}
+
+.term-item.invalid {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.term-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.term-pair code {
+  background: var(--term-bg);
+  color: var(--term);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.term-remove {
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.term-error {
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 /* ---- Result row provenance --------------------------------------------- */
 
 .origin-cell {
@@ -367,6 +480,23 @@ tr.row-anchor {
 
 .legend-anchors {
   color: var(--match);
+}
+
+.tag-origin-term {
+  color: var(--term);
+  background: var(--term-bg);
+  border-color: var(--term);
+  font-weight: 700;
+  margin-left: 6px;
+}
+
+tr.row-term {
+  outline: 2px solid #67e8f9;
+  outline-offset: -2px;
+}
+
+.legend-terms {
+  color: var(--term);
 }
 
 /* ---- Alternative (strict second-best) alignment ----------------------- */

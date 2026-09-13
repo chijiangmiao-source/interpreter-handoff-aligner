@@ -496,3 +496,212 @@ def test_sequence_failure_is_reported_before_compare_flag_check():
     )
     assert resp.status_code == 422
     assert resp.json()["path"] == "left[0].text"
+
+
+# --------------------------------------------------------------------------- #
+# Optional term_pairs: lead-declared exact-hit synonym correspondences.
+# --------------------------------------------------------------------------- #
+
+
+def test_term_pairs_absent_or_empty_keep_legacy_response():
+    payload = {
+        "left": [
+            {"time": 0, "text": "人工智能"},
+            {"time": 9000, "text": "结束语"},
+        ],
+        "right": [
+            {"time": 100, "text": "AI"},
+            {"time": 9200, "text": "结束语"},
+        ],
+    }
+    legacy = post(payload).json()
+    assert "term_pairs" not in legacy
+    assert all("term_pair" not in s for s in legacy["steps"])
+    # An explicitly empty term_pairs array is byte/shape identical.
+    assert post({**payload, "term_pairs": []}).json() == legacy
+
+
+def test_term_pair_exact_hit_waives_penalty_and_echoes_the_pair():
+    payload = {
+        "left": [
+            {"time": 0, "text": "人工智能"},
+            {"time": 9000, "text": "结束语"},
+        ],
+        "right": [
+            {"time": 100, "text": "AI"},
+            {"time": 9200, "text": "结束语"},
+        ],
+        "term_pairs": [{"left_text": "人工智能", "right_text": "AI"}],
+    }
+    data = post(payload).json()
+    assert data["term_pairs"] == [
+        {"left_text": "人工智能", "right_text": "AI"}
+    ]
+    hit = data["steps"][0]
+    assert hit["action"] == "match"
+    assert hit["cost"] == 100  # |0-100|, no mismatch penalty
+    assert hit["term_pair"] == {
+        "left_text": "人工智能", "right_text": "AI"
+    }
+    # The ordinary equal-text match carries no term marker.
+    assert "term_pair" not in data["steps"][1]
+    assert data["total_cost"] == 300
+
+
+def test_term_pair_miss_keeps_the_mismatch_penalty_and_marker_absent():
+    payload = {
+        "left": [{"time": 0, "text": "x"}],
+        "right": [{"time": 0, "text": "y"}],
+        "term_pairs": [{"left_text": "a", "right_text": "b"}],
+    }
+    data = post(payload).json()
+    assert data["total_cost"] == 3000
+    assert "term_pair" not in data["steps"][0]
+
+
+def test_term_pair_on_a_forced_anchor_waives_the_penalty_there_too():
+    payload = {
+        "left": [
+            {"time": 0, "text": "人工智能"},
+            {"time": 9000, "text": "结束语"},
+        ],
+        "right": [
+            {"time": 100, "text": "AI"},
+            {"time": 9200, "text": "结束语"},
+        ],
+        "anchors": [{"left": 0, "right": 0}],
+        "term_pairs": [{"left_text": "人工智能", "right_text": "AI"}],
+    }
+    data = post(payload).json()
+    anchor_row = next(s for s in data["steps"] if s["origin"] == "anchor")
+    assert anchor_row["cost"] == 100
+    assert anchor_row["term_pair"] == {
+        "left_text": "人工智能", "right_text": "AI"
+    }
+    assert data["anchors"] == [{"left": 0, "right": 0}]
+    assert data["term_pairs"] == [
+        {"left_text": "人工智能", "right_text": "AI"}
+    ]
+
+
+def test_term_pairs_constrain_the_alternative_path():
+    payload = {
+        "left": [
+            {"time": 0, "text": "g"},
+            {"time": 4200, "text": "p"},
+            {"time": 9000, "text": "t"},
+        ],
+        "right": [
+            {"time": 150, "text": "G"},
+            {"time": 4100, "text": "P"},
+            {"time": 12000, "text": "h"},
+        ],
+        "term_pairs": [
+            {"left_text": "g", "right_text": "G"},
+            {"left_text": "p", "right_text": "P"},
+        ],
+        "compare_alternative": True,
+    }
+    data = post(payload).json()
+    assert data["total_cost"] == 4250  # 150 + 100 + 2000 + 2000
+    assert data["alternative"] is not None
+    assert data["alternative"]["cost_diff"] == 0
+    assert data["alternative"]["steps"][0]["term_pair"] == {
+        "left_text": "g", "right_text": "G"
+    }
+
+
+def test_term_pairs_conflict_is_a_single_failure_on_first_item():
+    base = {"left": [], "right": []}
+
+    # Duplicate left_text -> the second entry's left_text is reported once.
+    resp = post({
+        **base,
+        "term_pairs": [
+            {"left_text": "a", "right_text": "x"},
+            {"left_text": "a", "right_text": "y"},
+        ],
+    })
+    assert resp.status_code == 422
+    body = resp.json()
+    assert set(body) == {"error", "path"}
+    assert body["path"] == "term_pairs[1].left_text"
+    assert "steps" not in body
+
+    # Duplicate right_text -> the second entry's right_text.
+    resp = post({
+        **base,
+        "term_pairs": [
+            {"left_text": "a", "right_text": "x"},
+            {"left_text": "b", "right_text": "x"},
+        ],
+    })
+    assert resp.json()["path"] == "term_pairs[1].right_text"
+
+
+def test_term_pairs_shape_failures():
+    base = {"left": [], "right": []}
+    cases = [
+        ("nope", "term_pairs"),
+        ([5], "term_pairs[0]"),
+        ([{"left_text": "a"}], "term_pairs[0].right_text"),
+        ([{"right_text": "b"}], "term_pairs[0].left_text"),
+        ([{"left_text": "", "right_text": "b"}], "term_pairs[0].left_text"),
+        ([{"left_text": "a", "right_text": ""}], "term_pairs[0].right_text"),
+        ([{"left_text": 1, "right_text": "b"}], "term_pairs[0].left_text"),
+        ([{"left_text": "a", "right_text": None}], "term_pairs[0].right_text"),
+        (
+            [{"left_text": "a", "right_text": "b", "x": 1}],
+            "term_pairs[0].x",
+        ),
+    ]
+    for term_pairs, expected_path in cases:
+        resp = post({**base, "term_pairs": term_pairs})
+        assert resp.status_code == 422
+        assert resp.json()["path"] == expected_path, (term_pairs, resp.json())
+
+
+def test_check_order_sequences_then_anchors_then_terms_then_flag():
+    # Bad note text beats a bad term pair and a bad compare flag.
+    resp = post({
+        "left": [{"time": 1, "text": ""}],
+        "right": [],
+        "anchors": [{"left": 9, "right": 9}],
+        "term_pairs": "nope",
+        "compare_alternative": "yes",
+    })
+    assert resp.json()["path"] == "left[0].text"
+
+    # With valid notes, a bad anchor beats a bad term pair.
+    resp = post({
+        "left": [{"time": 1, "text": "a"}],
+        "right": [{"time": 2, "text": "b"}],
+        "anchors": [{"left": 9, "right": 0}],
+        "term_pairs": "nope",
+    })
+    assert resp.json()["path"] == "anchors[0].left"
+
+    # With valid notes and anchors, the bad term pair beats the bad flag.
+    resp = post({
+        "left": [],
+        "right": [],
+        "term_pairs": "nope",
+        "compare_alternative": "yes",
+    })
+    assert resp.json()["path"] == "term_pairs"
+
+
+def test_deleting_all_term_pairs_restores_the_original_result():
+    payload = {
+        "left": [{"time": 0, "text": "人工智能"}],
+        "right": [{"time": 100, "text": "AI"}],
+    }
+    free = post(payload).json()
+    with_terms = post({
+        **payload,
+        "term_pairs": [{"left_text": "人工智能", "right_text": "AI"}],
+    }).json()
+    assert with_terms["total_cost"] == 100
+    assert free["total_cost"] == 3100
+    # Re-requesting with every term pair removed restores the free result.
+    assert post(payload).json() == free

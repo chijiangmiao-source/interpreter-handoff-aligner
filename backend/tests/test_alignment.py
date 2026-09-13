@@ -13,6 +13,18 @@ from app.alignment import (
 )
 
 
+def _synonymous(left_text: str, right_text: str, term_pairs) -> bool:
+    return (left_text, right_text) in set(term_pairs or [])
+
+
+def _term_pair_cost(a: dict, b: dict, term_pairs) -> int:
+    """Independent reference for a pairing cost under declared term pairs."""
+    waived = a["text"] == b["text"] or _synonymous(
+        a["text"], b["text"], term_pairs
+    )
+    return abs(a["time"] - b["time"]) + (0 if waived else MISMATCH_PENALTY)
+
+
 def note(time: int, text: str = "x"):
     return {"time": time, "text": text}
 
@@ -717,3 +729,254 @@ def test_alternative_large_inputs_200_items():
     assert sum(s["cost"] for s in alt["steps"]) == alt["total_cost"]
     assert len([s for s in alt["steps"] if s["left"]]) == 200
     assert len([s for s in alt["steps"] if s["right"]]) == 200
+
+
+# --------------------------------------------------------------------------- #
+# Optional term pairs: exact-hit synonym correspondences waiving the penalty.
+# --------------------------------------------------------------------------- #
+
+
+def _term_constrained_brute(left, right, anchors, term_pairs):
+    """Constrained optimum with anchors and the term synonym cost model."""
+    m, n = len(left), len(right)
+    bounds = [(-1, -1), *anchors, (m, n)]
+    total = 0
+    for lo, hi in zip(bounds, bounds[1:]):
+        sub_l = left[lo[0] + 1 : hi[0]]
+        sub_r = right[lo[1] + 1 : hi[1]]
+
+        @lru_cache(maxsize=None)
+        def opt(i: int, j: int) -> float:
+            if i == len(sub_l) and j == len(sub_r):
+                return 0
+            best = float("inf")
+            if i < len(sub_l) and j < len(sub_r):
+                best = min(
+                    best,
+                    _term_pair_cost(sub_l[i], sub_r[j], term_pairs)
+                    + opt(i + 1, j + 1),
+                )
+            if i < len(sub_l):
+                best = min(best, GAP_COST + opt(i + 1, j))
+            if j < len(sub_r):
+                best = min(best, GAP_COST + opt(i, j + 1))
+            return best
+
+        total += int(opt(0, 0))
+        if hi != (m, n):
+            total += _term_pair_cost(left[hi[0]], right[hi[1]], term_pairs)
+    return total
+
+
+def test_term_pairs_absent_or_empty_keep_legacy_result():
+    left = [note(0, "人工智能"), note(9000, "结束语")]
+    right = [note(100, "AI"), note(9200, "结束语")]
+    free = align(left, right)
+    assert "term_pairs" not in free
+    assert all("term_pair" not in s for s in free["steps"])
+    assert align(left, right, term_pairs=None) == free
+    assert align(left, right, term_pairs=[]) == free
+
+
+def test_term_pairs_exact_hit_waives_penalty_and_tags_the_row():
+    left = [note(0, "人工智能"), note(9000, "结束语")]
+    right = [note(100, "AI"), note(9200, "结束语")]
+    result = align(left, right, term_pairs=[("人工智能", "AI")])
+
+    assert result["term_pairs"] == [
+        {"left_text": "人工智能", "right_text": "AI"}
+    ]
+    rows = result["steps"]
+    assert [s["action"] for s in rows] == ["match", "match"]
+    # The synonym match costs the plain time difference (100), no +3000.
+    hit = rows[0]
+    assert hit["cost"] == 100
+    assert hit["term_pair"] == {"left_text": "人工智能", "right_text": "AI"}
+    # The equal-text match keeps the ordinary same-text presentation.
+    assert "term_pair" not in rows[1]
+    assert rows[1]["cost"] == 200
+    assert result["total_cost"] == 300
+
+
+def test_term_pairs_non_hit_different_text_stays_penalized():
+    left = [note(0, "x")]
+    right = [note(0, "y")]
+    result = align(left, right, term_pairs=[("a", "b")])
+    assert result["total_cost"] == MISMATCH_PENALTY
+    assert "term_pair" not in result["steps"][0]
+
+
+def test_term_pairs_waive_on_forced_anchor_match():
+    left = [note(0, "人工智能"), note(9000, "结束语")]
+    right = [note(100, "AI"), note(9200, "结束语")]
+    result = align(
+        left, right,
+        anchors=[(0, 0)], term_pairs=[("人工智能", "AI")],
+    )
+    anchor_row = next(s for s in result["steps"] if s["origin"] == ORIGIN_ANCHOR)
+    assert anchor_row["cost"] == 100
+    assert anchor_row["term_pair"] == {
+        "left_text": "人工智能", "right_text": "AI"
+    }
+    # The echo is present even though anchors are also in the response.
+    assert result["term_pairs"] == [
+        {"left_text": "人工智能", "right_text": "AI"}
+    ]
+
+
+def test_term_pairs_apply_to_the_alternative_path_too():
+    # Two same-time-position synonym notes plus a tail gap tie: the
+    # alternative (gap-order swap) and any synonym match share the rule.
+    left = [note(0, "g"), note(4200, "p"), note(9000, "t")]
+    right = [note(150, "G"), note(4100, "P"), note(12000, "h")]
+    pairs = [("g", "G"), ("p", "P")]
+    result = align(left, right, compare_alternative=True, term_pairs=pairs)
+    alt = result["alternative"]
+    assert alt is not None and alt["cost_diff"] == 0
+    # Both opening matches are term hits in primary and alternative.
+    for path in (result["steps"], alt["steps"]):
+        assert path[0]["term_pair"] == {"left_text": "g", "right_text": "G"}
+        assert path[1]["term_pair"] == {"left_text": "p", "right_text": "P"}
+    # Waiving both penalties turns the primary into the two matches + gaps at
+    # 150 + 100 + 2000 + 2000 = 4250 instead of the penalized 10250.
+    assert result["total_cost"] == 4250
+
+
+def test_term_pairs_exhaustive_against_independent_recursion():
+    rng = random.Random(20260913)
+    cases = 0
+    for trial in range(500):
+        m = rng.randrange(0, 6)
+        nn = rng.randrange(0, 6)
+        vocab = ("a", "b", "c")
+        left, right = [], []
+        t = 0
+        for _ in range(m):
+            t += rng.randrange(0, 7000)
+            left.append(note(t, rng.choice(vocab)))
+        t = 0
+        for _ in range(nn):
+            t += rng.randrange(0, 7000)
+            right.append(note(t, rng.choice(vocab)))
+
+        # Declare a random synonym table: each left vocab word maps once to
+        # at most one right vocab word and vice versa (validation rule).
+        perm = list(vocab)
+        rng.shuffle(perm)
+        declared = list(zip(vocab, perm))
+        k = rng.randrange(0, len(declared) + 1)
+        term_pairs = declared[:k]
+
+        # Optional monotonic anchors.
+        ka = rng.randrange(0, min(m, nn) + 1)
+        anchors = list(zip(
+            sorted(rng.sample(range(m), ka)),
+            sorted(rng.sample(range(nn), ka)),
+        ))
+
+        result = align(
+            left, right, anchors=anchors or None, term_pairs=term_pairs or None
+        )
+        assert result["total_cost"] == _term_constrained_brute(
+            left, right, anchors, term_pairs
+        )
+
+        # Every hit row is an exact declared pair on different texts; every
+        # other match row carries no term_pair marker.
+        for s in result["steps"]:
+            if s["action"] != "match":
+                assert "term_pair" not in s
+                continue
+            lt, rt = s["left"]["text"], s["right"]["text"]
+            if "term_pair" in s:
+                assert (lt, rt) in set(term_pairs)
+                assert lt != rt
+                # A tagged row's cost is exactly the time difference.
+                assert s["cost"] == abs(s["left"]["time"] - s["right"]["time"])
+            else:
+                assert not (
+                    lt != rt and _synonymous(lt, rt, term_pairs)
+                )
+        cases += 1
+    assert cases == 500
+
+
+def test_term_pairs_alternative_exhaustive_against_enumeration():
+    """The 2-best runner-up under the synonym cost matches an enumeration."""
+
+    def enumerate_ranked(left, right, term_pairs):
+        m, n = len(left), len(right)
+        found: dict[tuple, int] = {}
+
+        def rec(i, j, acc, cost):
+            if i == m and j == n:
+                found[tuple(acc)] = cost
+                return
+            if i < m and j < n:
+                c = _term_pair_cost(left[i], right[j], term_pairs)
+                rec(i + 1, j + 1,
+                    acc + [("match", (left[i]["time"], left[i]["text"]),
+                            (right[j]["time"], right[j]["text"]), c)],
+                    cost + c)
+            if j < n:
+                rec(i, j + 1,
+                    acc + [("left_gap", None,
+                            (right[j]["time"], right[j]["text"]), GAP_COST)],
+                    cost + GAP_COST)
+            if i < m:
+                rec(i + 1, j,
+                    acc + [("right_gap",
+                            (left[i]["time"], left[i]["text"]), None, GAP_COST)],
+                    cost + GAP_COST)
+
+        rec(0, 0, [], 0)
+        return sorted(found.items(), key=cmp_to_key(_compare_paths))
+
+    rng = random.Random(99132026)
+    cases = 0
+    for _ in range(300):
+        m = rng.randrange(0, 5)
+        nn = rng.randrange(0, 5)
+        left, right = [], []
+        t = 0
+        for _ in range(m):
+            t += rng.randrange(1, 7) * 1000
+            left.append(note(t, rng.choice(("a", "b"))))
+        t = 0
+        for _ in range(nn):
+            t += rng.randrange(1, 7) * 1000
+            right.append(note(t, rng.choice(("c", "d"))))
+        # Every (a/b) <-> (c/d) combination may be declared synonym on hits.
+        term_pairs = [
+            (lt, rt) for lt in ("a", "b") for rt in ("c", "d")
+            if rng.random() < 0.5
+        ]
+        # Per-side uniqueness: drop later rows reusing a side word.
+        seen_l, seen_r, unique_pairs = set(), set(), []
+        for lt, rt in term_pairs:
+            if lt in seen_l or rt in seen_r:
+                continue
+            seen_l.add(lt)
+            seen_r.add(rt)
+            unique_pairs.append((lt, rt))
+        term_pairs = unique_pairs
+
+        result = align(
+            left, right, compare_alternative=True,
+            term_pairs=term_pairs or None,
+        )
+        ranked = enumerate_ranked(left, right, term_pairs)
+        best1, cost1 = ranked[0]
+        assert tuple(_step_sig(s) for s in result["steps"]) == best1
+        assert result["total_cost"] == cost1
+        if len(ranked) > 1:
+            sig2, cost2 = ranked[1]
+            alt = result["alternative"]
+            assert alt is not None
+            assert tuple(_step_sig(s) for s in alt["steps"]) == sig2
+            assert alt["total_cost"] == cost2
+            assert alt["cost_diff"] == cost2 - cost1
+        else:
+            assert result["alternative"] is None
+        cases += 1
+    assert cases == 300

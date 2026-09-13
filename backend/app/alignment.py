@@ -41,6 +41,16 @@ When ``compare_alternative`` is true the response additionally carries an
 under exactly the same costs and tie rules (``None`` when the legal path is
 unique, which empty input or a fully pinning anchor set can force).
 
+Optional ``term_pairs`` are lead-confirmed ``(left_text, right_text)`` term
+correspondences.  Only a pairing whose two note texts are an EXACT hit of a
+declared pair is treated as synonymous: the mismatch penalty is waived and
+the pair costs the plain time difference.  Time-difference costs, gap costs,
+anchor constraints, the tie-break order and the alternative-path ranking are
+all unchanged.  Hit match rows (including forced anchor matches and the
+alternative's matches) carry the ``term_pair`` they hit, and a non-empty
+request echoes ``term_pairs``; absent or empty, request computation and the
+response shape stay byte-for-byte identical to before.
+
 Complete paths are totally ordered first by total cost.  Two equal-cost
 paths are compared at their LAST differing step — the grid cell where they
 rejoin while tracing back is precisely the cell at which the forward DP
@@ -88,10 +98,73 @@ ACTION_PRIORITY = {
 }
 
 
-def match_cost(left_item: dict[str, Any], right_item: dict[str, Any]) -> int:
-    """Cost of pairing two notes: |tL - tR| (+ MISMATCH when texts differ)."""
+class TermSynonyms:
+    """Lead-confirmed term correspondences consulted only on exact hits.
+
+    A match edge waives the mismatch penalty iff its two note texts are a
+    declared ``(left_text, right_text)`` pair compared verbatim; anything
+    else keeps the ordinary different-text cost.  Validation already
+    guarantees each side text is mapped once, but the membership lookups
+    stay set-based so the algorithm itself makes no uniqueness assumptions.
+    """
+
+    __slots__ = ("_by_left",)
+
+    def __init__(self, pairs: list[tuple[str, str]]):
+        self._by_left: dict[str, set[str]] = {}
+        for left_text, right_text in pairs:
+            self._by_left.setdefault(left_text, set()).add(right_text)
+
+    def hit(
+        self, left_text: str, right_text: str
+    ) -> tuple[str, str] | None:
+        """Return the declared pair on an exact hit, else None."""
+        if right_text in self._by_left.get(left_text, ()):
+            return (left_text, right_text)
+        return None
+
+
+def term_hit(
+    left_item: dict[str, Any],
+    right_item: dict[str, Any],
+    terms: TermSynonyms | None,
+) -> tuple[str, str] | None:
+    """The term pair an exact pairing of these notes hits, if any."""
+    if terms is None:
+        return None
+    return terms.hit(left_item["text"], right_item["text"])
+
+
+def waived_term_pair(
+    left_item: dict[str, Any],
+    right_item: dict[str, Any],
+    terms: TermSynonyms | None,
+) -> tuple[str, str] | None:
+    """Declared pair that actually waives the penalty for this pairing.
+
+    An exact hit only matters as term provenance when the two texts would
+    otherwise differ (and hence be penalized); equal-text pairings already
+    match on their own, so they keep the ordinary same-text presentation.
+    """
+    if left_item["text"] == right_item["text"]:
+        return None
+    return term_hit(left_item, right_item, terms)
+
+
+def match_cost(
+    left_item: dict[str, Any],
+    right_item: dict[str, Any],
+    terms: TermSynonyms | None = None,
+) -> int:
+    """Cost of pairing two notes: |tL - tR| (+ MISMATCH on different text).
+
+    An exact term-pair hit makes two otherwise different texts synonymous:
+    the mismatch penalty is waived and only the time difference remains.
+    """
+    synonymous = term_hit(left_item, right_item, terms) is not None
     return abs(left_item["time"] - right_item["time"]) + (
-        0 if left_item["text"] == right_item["text"] else MISMATCH_PENALTY
+        0 if (left_item["text"] == right_item["text"] or synonymous)
+        else MISMATCH_PENALTY
     )
 
 
@@ -110,6 +183,7 @@ def _make_step(
     right_item: dict[str, Any] | None,
     cost: int,
     origin: str | None = None,
+    term_pair: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build one serializable timeline row (note copies, no index leakage)."""
     step: dict[str, Any] = {
@@ -128,6 +202,12 @@ def _make_step(
     }
     if origin is not None:
         step["origin"] = origin
+    if term_pair is not None:
+        # Provenance of a penalty-waived pairing: the exact term pair hit.
+        step["term_pair"] = {
+            "left_text": term_pair[0],
+            "right_text": term_pair[1],
+        }
     return step
 
 
@@ -140,6 +220,7 @@ def _fill_dp(
     j1: int,
     dp: list[list[int]],
     chosen: list[list[str | None]],
+    terms: TermSynonyms | None = None,
 ) -> None:
     """Fill the rectangle from entry corner ``(i0, j0)`` to ``(i1, j1)``.
 
@@ -161,7 +242,7 @@ def _fill_dp(
         li = left[i - 1]
         for j in range(j0 + 1, j1 + 1):
             rj = right[j - 1]
-            mc = match_cost(li, rj)
+            mc = match_cost(li, rj, terms)
 
             # Predecessors, already in tie-break priority order
             # (match, left-side gap, right-side gap). A move from (i, j-1)
@@ -186,6 +267,7 @@ def _trace_segment(
     i1: int,
     j1: int,
     chosen: list[list[str | None]],
+    terms: TermSynonyms | None = None,
 ) -> list[dict[str, Any]]:
     """Trace one rectangle back from ``(i1, j1)`` to its entry ``(i0, j0)``.
 
@@ -201,7 +283,8 @@ def _trace_segment(
             l, r = left[i - 1], right[j - 1]
             out.append(
                 _make_step(
-                    ACTION_MATCH, l, r, match_cost(l, r), origin=ORIGIN_AUTO
+                    ACTION_MATCH, l, r, match_cost(l, r, terms),
+                    origin=ORIGIN_AUTO, term_pair=waived_term_pair(l, r, terms),
                 )
             )
             i, j = i - 1, j - 1
@@ -253,6 +336,8 @@ def _compute_primary(
     left: list[dict[str, Any]],
     right: list[dict[str, Any]],
     anchor_pairs: list[tuple[int, int]],
+    terms: TermSynonyms | None = None,
+    term_pairs: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """The unique, tie-broken minimum-cost timeline (the existing DP)."""
     m, n = len(left), len(right)
@@ -272,16 +357,24 @@ def _compute_primary(
     for ai, aj in anchor_pairs:
         # 1) Best alignment of the notes strictly before this anchor, i.e.
         #    from the entry corner to grid point (ai, aj).
-        _fill_dp(left, right, i0, j0, ai, aj, dp, chosen)
-        steps.extend(reversed(_trace_segment(left, right, i0, j0, ai, aj, chosen)))
+        _fill_dp(left, right, i0, j0, ai, aj, dp, chosen, terms)
+        steps.extend(
+            reversed(
+                _trace_segment(
+                    left, right, i0, j0, ai, aj, chosen, terms
+                )
+            )
+        )
 
         # 2) The anchor itself: forced diagonal match (ai, aj) -> (ai+1, aj+1)
-        #    charged at its ordinary match cost.
+        #    charged at its ordinary match cost (an exact term-pair hit waives
+        #    the mismatch penalty just like a generated pairing).
         l, r = left[ai], right[aj]
-        anchor_cost = match_cost(l, r)
+        anchor_cost = match_cost(l, r, terms)
         steps.append(
             _make_step(
-                ACTION_MATCH, l, r, anchor_cost, origin=ORIGIN_ANCHOR
+                ACTION_MATCH, l, r, anchor_cost, origin=ORIGIN_ANCHOR,
+                term_pair=waived_term_pair(l, r, terms),
             )
         )
 
@@ -290,14 +383,18 @@ def _compute_primary(
         i0, j0 = ai + 1, aj + 1
 
     # Trailing segment after the last anchor (or the whole grid with none).
-    _fill_dp(left, right, i0, j0, m, n, dp, chosen)
-    steps.extend(reversed(_trace_segment(left, right, i0, j0, m, n, chosen)))
+    _fill_dp(left, right, i0, j0, m, n, dp, chosen, terms)
+    steps.extend(
+        reversed(_trace_segment(left, right, i0, j0, m, n, chosen, terms))
+    )
 
-    return _finalize(steps, anchor_pairs)
+    return _finalize(steps, anchor_pairs, term_pairs or [])
 
 
 def _finalize(
-    steps: list[dict[str, Any]], anchor_pairs: list[tuple[int, int]]
+    steps: list[dict[str, Any]],
+    anchor_pairs: list[tuple[int, int]],
+    term_pairs: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Attach cumulative costs and wrap the rows in the response object."""
     # Cumulative cost lets the UI replay the computation row by row.
@@ -328,6 +425,17 @@ def _finalize(
         # Historical contract: an unanchored response carries no extra fields.
         for step in steps:
             step.pop("origin", None)
+
+    if term_pairs:
+        # Term-aware run: echo the declared correspondences so the UI keeps
+        # the panel and can attribute each waived-penalty row to its pair.
+        result["term_pairs"] = [
+            {"left_text": lt, "right_text": rt} for lt, rt in term_pairs
+        ]
+    else:
+        # Historical contract: without declared pairs no term fields appear.
+        for step in steps:
+            step.pop("term_pair", None)
 
     return result
 
@@ -407,13 +515,15 @@ def _edge_step(
     i: int,
     j: int,
     anchored: bool,
+    terms: TermSynonyms | None = None,
 ) -> dict[str, Any]:
     """The row added by ``action`` arriving at local cell (i, j)."""
     origin = ORIGIN_AUTO if anchored else None
     if action == ACTION_MATCH:
+        l, r = left[i - 1], right[j - 1]
         return _make_step(
-            ACTION_MATCH, left[i - 1], right[j - 1],
-            match_cost(left[i - 1], right[j - 1]), origin=origin,
+            ACTION_MATCH, l, r, match_cost(l, r, terms), origin=origin,
+            term_pair=waived_term_pair(l, r, terms),
         )
     if action == ACTION_LEFT_GAP:
         return _make_step(
@@ -433,6 +543,7 @@ def _fill_segment_two_best(
     j1: int,
     base_cost: int,
     anchored: bool,
+    terms: TermSynonyms | None = None,
 ) -> tuple[list[list[tuple | None]], tuple]:
     """Best two prefixes for every cell in one anchor-bounded rectangle.
 
@@ -467,13 +578,13 @@ def _fill_segment_two_best(
     for u in range(1, h + 1):
         pred = table[u - 1][0][0]
         i = i0 + u
-        step = _edge_step(ACTION_RIGHT_GAP, left, right, i, j0, anchored)
+        step = _edge_step(ACTION_RIGHT_GAP, left, right, i, j0, anchored, terms)
         keep(u, 0, [(pred[0] + GAP_COST,
                      _ACTION_CODE[ACTION_RIGHT_GAP], pred, step)])
     for v in range(1, w + 1):
         pred = table[0][v - 1][0]
         j = j0 + v
-        step = _edge_step(ACTION_LEFT_GAP, left, right, i0, j, anchored)
+        step = _edge_step(ACTION_LEFT_GAP, left, right, i0, j, anchored, terms)
         keep(0, v, [(pred[0] + GAP_COST,
                      _ACTION_CODE[ACTION_LEFT_GAP], pred, step)])
 
@@ -486,27 +597,27 @@ def _fill_segment_two_best(
             up_best, up_second = table[u - 1][v]      # -> right_gap edge
             left_best, left_second = table[u][v - 1]  # -> left_gap edge
 
-            mc = match_cost(left[i - 1], right[j - 1])
+            mc = match_cost(left[i - 1], right[j - 1], terms)
             for pred in (diag_best, diag_second):
                 if pred is not None:
                     candidates.append(
                         (pred[0] + mc,
                          _ACTION_CODE[ACTION_MATCH], pred,
-                         _edge_step(ACTION_MATCH, left, right, i, j, anchored))
+                         _edge_step(ACTION_MATCH, left, right, i, j, anchored, terms))
                     )
             for pred in (up_best, up_second):
                 if pred is not None:
                     candidates.append(
                         (pred[0] + GAP_COST,
                          _ACTION_CODE[ACTION_RIGHT_GAP], pred,
-                         _edge_step(ACTION_RIGHT_GAP, left, right, i, j, anchored))
+                         _edge_step(ACTION_RIGHT_GAP, left, right, i, j, anchored, terms))
                     )
             for pred in (left_best, left_second):
                 if pred is not None:
                     candidates.append(
                         (pred[0] + GAP_COST,
                          _ACTION_CODE[ACTION_LEFT_GAP], pred,
-                         _edge_step(ACTION_LEFT_GAP, left, right, i, j, anchored))
+                         _edge_step(ACTION_LEFT_GAP, left, right, i, j, anchored, terms))
                     )
             keep(u, v, candidates)
 
@@ -543,6 +654,7 @@ def _find_alternative(
     anchor_pairs: list[tuple[int, int]],
     primary_steps: list[dict[str, Any]],
     primary_total: int,
+    terms: TermSynonyms | None = None,
 ) -> dict[str, Any] | None:
     """The strictly second-ranked distinct complete path, or None.
 
@@ -551,7 +663,9 @@ def _find_alternative(
     downgraded to its second-best; the downgrade with the smallest extra
     cost wins (the earliest such segment on a tie, since then the last
     differing step is resolved in that segment's favour).  Forced anchors
-    are identical rows in both paths and simply chain the segments.
+    are identical rows in both paths and simply chain the segments.  The
+    same term correspondences apply to every segment and every forced
+    anchor, so the term rule constrains both paths identically.
     """
     m, n = len(left), len(right)
     anchored = bool(anchor_pairs)
@@ -564,14 +678,14 @@ def _find_alternative(
     base = 0
     for i0, j0, i1, j1, _forced in pieces:
         table, sentinel = _fill_segment_two_best(
-            left, right, i0, j0, i1, j1, base, anchored
+            left, right, i0, j0, i1, j1, base, anchored, terms
         )
         best_ref, second_ref = table[i1 - i0][j1 - j0]
         exits.append((best_ref, second_ref))
         sentinels.append(sentinel)
         if (i1, j1) != (m, n):
             # Forced anchor edge seeds the next segment's entry cost.
-            base = best_ref[0] + match_cost(left[i1], right[j1])
+            base = best_ref[0] + match_cost(left[i1], right[j1], terms)
 
     # Sanity: the chained segment bests are exactly the DP primary total.
     if exits[-1][0][0] != primary_total:
@@ -599,8 +713,8 @@ def _find_alternative(
             l, r = left[ai], right[aj]
             alt_steps.append(
                 _make_step(
-                    ACTION_MATCH, l, r, match_cost(l, r),
-                    origin=ORIGIN_ANCHOR,
+                    ACTION_MATCH, l, r, match_cost(l, r, terms),
+                    origin=ORIGIN_ANCHOR, term_pair=waived_term_pair(l, r, terms),
                 )
             )
 
@@ -659,10 +773,21 @@ def align(
     right: list[dict[str, Any]],
     anchors: list[tuple[int, int]] | None = None,
     compare_alternative: bool = False,
+    term_pairs: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     anchor_pairs: list[tuple[int, int]] = list(anchors or [])
+    declared_pairs: list[tuple[str, str]] = list(term_pairs or [])
+    # A non-empty declaration switches on the synonym model; an empty/absent
+    # list leaves costs and the response shape exactly as before.
+    terms = TermSynonyms(declared_pairs) if declared_pairs else None
 
-    result = _compute_primary(left, right, anchor_pairs)
+    result = _compute_primary(
+        left,
+        right,
+        anchor_pairs,
+        terms,
+        declared_pairs if declared_pairs else None,
+    )
 
     if compare_alternative:
         result["alternative"] = _find_alternative(
@@ -671,6 +796,7 @@ def align(
             anchor_pairs,
             result["steps"],
             result["total_cost"],
+            terms,
         )
 
     return result

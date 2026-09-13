@@ -1,6 +1,11 @@
 """Tests for structural validation and the single-error contract."""
 
-from app.validation import MAX_ITEMS, validate_anchors, validate_sequence
+from app.validation import (
+    MAX_ITEMS,
+    validate_anchors,
+    validate_sequence,
+    validate_term_pairs,
+)
 
 
 def seq(*items):
@@ -185,3 +190,130 @@ def test_anchors_big_indices_boundary():
     assert anchors_error([{"left": 200, "right": 199}], m=200, n=200)[0] == (
         "anchors[0].left"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Term pairs: non-empty strings, one mapping per side, single first conflict.
+# --------------------------------------------------------------------------- #
+
+
+def term_error(pairs):
+    """Run validate_term_pairs and return (path, message)."""
+    return validate_term_pairs(pairs)
+
+
+def test_term_pairs_empty_and_none_shape_are_valid():
+    assert validate_term_pairs([]) == (None, None)
+
+
+def test_term_pairs_not_an_array():
+    path, _ = term_error({"left_text": "a", "right_text": "b"})
+    assert path == "term_pairs"
+    path, _ = term_error("nope")
+    assert path == "term_pairs"
+
+
+def test_term_pairs_entry_must_be_object():
+    assert term_error([5])[0] == "term_pairs[0]"
+    assert term_error([["a", "b"]])[0] == "term_pairs[0]"
+    assert term_error([None])[0] == "term_pairs[0]"
+
+
+def test_term_pairs_keys_only_left_right_text():
+    assert (
+        term_error([{"left_text": "a", "right_text": "b", "who": 1}])[0]
+        == "term_pairs[0].who"
+    )
+    assert term_error([{"left_text": "a"}])[0] == "term_pairs[0].right_text"
+    assert term_error([{"right_text": "b"}])[0] == "term_pairs[0].left_text"
+
+
+def test_term_pairs_fields_must_be_non_empty_strings():
+    for bad in (1, True, None, ["a"], {}):
+        assert (
+            term_error([{"left_text": bad, "right_text": "b"}])[0]
+            == "term_pairs[0].left_text"
+        ), bad
+        assert (
+            term_error([{"left_text": "a", "right_text": bad}])[0]
+            == "term_pairs[0].right_text"
+        ), bad
+    assert (
+        term_error([{"left_text": "", "right_text": "b"}])[0]
+        == "term_pairs[0].left_text"
+    )
+    assert (
+        term_error([{"left_text": "a", "right_text": ""}])[0]
+        == "term_pairs[0].right_text"
+    )
+
+
+def test_term_pairs_whitespace_only_text_is_non_empty_and_valid():
+    assert (
+        validate_term_pairs([{"left_text": " ", "right_text": "b"}])
+        == (None, None)
+    )
+
+
+def test_term_pairs_duplicate_left_text_reports_first_conflict():
+    pairs = [
+        {"left_text": "人工智能", "right_text": "AI"},
+        {"left_text": "人工智能", "right_text": "ML"},
+    ]
+    path, msg = term_error(pairs)
+    assert path == "term_pairs[1].left_text"
+    assert "人工智能" in msg
+
+
+def test_term_pairs_duplicate_right_text_reports_first_conflict():
+    pairs = [
+        {"left_text": "人工智能", "right_text": "AI"},
+        {"left_text": "机器学习", "right_text": "AI"},
+    ]
+    path, _ = term_error(pairs)
+    assert path == "term_pairs[1].right_text"
+
+
+def test_term_pairs_only_one_conflict_reported_even_if_both_sides_clash():
+    # Both sides of the second pair conflict; the left field is examined
+    # first, so a single failure on term_pairs[1].left_text is produced.
+    pairs = [
+        {"left_text": "a", "right_text": "x"},
+        {"left_text": "a", "right_text": "x"},
+    ]
+    path, message = term_error(pairs)
+    assert (path, message) == (
+        "term_pairs[1].left_text",
+        "term_pairs[1].left_text 「a」已映射过，同一侧术语不可重复对应。",
+    )
+
+
+def test_term_pairs_same_text_on_opposite_sides_is_allowed():
+    # The uniqueness rule is per side; cross-side reuse is a normal mapping.
+    assert (
+        validate_term_pairs(
+            [{"left_text": "a", "right_text": "b"},
+             {"left_text": "b", "right_text": "c"}]
+        )
+        == (None, None)
+    )
+
+
+def test_term_pairs_identical_pair_twice_conflicts_once():
+    pairs = [
+        {"left_text": "a", "right_text": "b"},
+        {"left_text": "a", "right_text": "b"},
+    ]
+    assert term_error(pairs)[0] == "term_pairs[1].left_text"
+
+
+def test_term_pairs_first_conflict_wins_among_several():
+    # Index 1 is fine; index 2 conflicts with index 0 on the right; index 3
+    # also conflicts but must never be reported after the earlier one.
+    pairs = [
+        {"left_text": "a", "right_text": "x"},
+        {"left_text": "b", "right_text": "y"},
+        {"left_text": "c", "right_text": "x"},
+        {"left_text": "a", "right_text": "z"},
+    ]
+    assert term_error(pairs)[0] == "term_pairs[2].right_text"

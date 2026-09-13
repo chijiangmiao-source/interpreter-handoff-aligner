@@ -1,9 +1,11 @@
 import { useMemo, useRef, useState } from "react";
 import AnchorPanel, { type PickerNote } from "./AnchorPanel";
+import TermPairPanel from "./TermPairPanel";
 import HighlightedTextarea from "./HighlightedTextarea";
 import ResultTimeline from "./ResultTimeline";
 import { alignNotes, rootRawText, AlignRequestError } from "./api";
 import { validateAnchors, type AnchorIssue } from "./anchors";
+import { validateTermPairs, type TermPairIssue } from "./termPairs";
 import {
   JsonSourceError,
   locateOffset,
@@ -11,7 +13,7 @@ import {
   type Range,
 } from "./jsonLocations";
 import { validateSequence } from "./validation";
-import type { AlignResponse, Anchor, Int } from "./types";
+import type { AlignResponse, Anchor, TermPair, Int } from "./types";
 
 type Side = "left" | "right";
 
@@ -22,6 +24,8 @@ interface MarkedError {
   side: Side | null;
   /** index into the anchors array when this failure concerns an anchor */
   anchorIndex?: number;
+  /** index into the term_pairs array when this failure concerns a term pair */
+  termIndex?: number;
   /** character offset inside the offending textarea (malformed JSON) */
   offset?: number;
 }
@@ -55,6 +59,12 @@ function anchorIndexFromPath(path: string): number {
   return match ? Number(match[1]) : -1;
 }
 
+/** Extract the term-pair index from `term_pairs[2].left_text`, else -1. */
+function termIndexFromPath(path: string): number {
+  const match = /^term_pairs\[(\d+)\]/.exec(path);
+  return match ? Number(match[1]) : -1;
+}
+
 export default function App() {
   const [leftText, setLeftText] = useState(SAMPLE_LEFT);
   const [rightText, setRightText] = useState(SAMPLE_RIGHT);
@@ -71,6 +81,10 @@ export default function App() {
   // changes what is computed alongside the optimum; it never alters the
   // optimal timeline itself.
   const [compareAlt, setCompareAlt] = useState(false);
+  // Optional lead-declared term correspondences. A pair is always kept when
+  // added; a same-side duplicate mapping is flagged on the first conflict
+  // instead of silently dropped, mirroring the anchor crossing UX.
+  const [termPairs, setTermPairs] = useState<TermPair[]>([]);
   // Bumped by every input/anchor mutation. A submission captures the current
   // generation and only applies its response while no mutation has happened
   // since, so a late response never resurrects a timeline computed from
@@ -139,6 +153,23 @@ export default function App() {
   }
 
   /**
+   * Surface the first same-side term conflict (if any) exactly like a server
+   * 422 would: one banner plus the offending term row flagged in place.
+   */
+  function applyTermIssue(issue: TermPairIssue | null) {
+    if (issue) {
+      setError({
+        message: issue.message,
+        path: issue.path,
+        side: null,
+        termIndex: issue.index >= 0 ? issue.index : undefined,
+      });
+    } else {
+      setError(null);
+    }
+  }
+
+  /**
    * Pin a pair. The candidate is always kept in the list; when it breaks a
    * rule (at pick time the only reachable case is a crossing pair) the first
    * offending anchor is flagged instead of silently dropping one side's mark.
@@ -161,6 +192,28 @@ export default function App() {
     applyAnchorIssue(
       validateAnchors(remaining, leftNotes.length, rightNotes.length),
     );
+    setResult(null);
+  }
+
+  /**
+   * Declare a term pair. The candidate is always kept in the list; when it
+   * maps a side term already mapped (same-side duplicate), the first
+   * conflicting pair is flagged in place instead of silently dropping it.
+   */
+  function addTermPair(candidate: TermPair) {
+    submitSeq.current += 1;
+    const tentative = [...termPairs, candidate];
+    setTermPairs(tentative);
+    applyTermIssue(validateTermPairs(tentative));
+    setResult(null);
+  }
+
+  function removeTermPair(index: number) {
+    submitSeq.current += 1;
+    const remaining = termPairs.filter((_, k) => k !== index);
+    setTermPairs(remaining);
+    // Re-flag the first remaining conflict, if any; otherwise clear it.
+    applyTermIssue(validateTermPairs(remaining));
     setResult(null);
   }
 
@@ -264,6 +317,18 @@ export default function App() {
         return;
       }
 
+      // --- Phase 2c: term pairs need non-empty texts and unique per-side ---
+      const termIssue = validateTermPairs(termPairs);
+      if (termIssue) {
+        setError({
+          message: termIssue.message,
+          path: termIssue.path,
+          side: null,
+          termIndex: termIssue.index >= 0 ? termIssue.index : undefined,
+        });
+        return;
+      }
+
       // --- Phase 3: the server performs the DP alignment ------------------
       // The raw array source is forwarded verbatim so integer literals
       // beyond Number.MAX_SAFE_INTEGER keep their exact digits. Anchors are
@@ -272,6 +337,10 @@ export default function App() {
       const leftRaw = rootRawText(leftText);
       const rightRaw = rootRawText(rightText);
       const anchorsToSend = anchors.length > 0 ? anchors : undefined;
+      // Term pairs are only sent when at least one correspondence is
+      // declared, keeping term-free requests byte-for-byte identical to the
+      // legacy API.
+      const termsToSend = termPairs.length > 0 ? termPairs : undefined;
       try {
         const aligned = await alignNotes(
           leftRaw,
@@ -279,6 +348,7 @@ export default function App() {
           fetch,
           anchorsToSend,
           compareAlt,
+          termsToSend,
         );
         // The user edited the notes or anchors while the request was in
         // flight: this timeline was computed from superseded input, so it
@@ -291,6 +361,7 @@ export default function App() {
         if (!isCurrent()) return;
         if (e instanceof AlignRequestError && e.path) {
           const anchorIndex = anchorIndexFromPath(e.path);
+          const termIndex = termIndexFromPath(e.path);
           if (anchorIndex >= 0 || e.path === "anchors") {
             // Anchor failure: keep both inputs and every selected marker,
             // flag the single offending anchor, and show no new timeline.
@@ -299,6 +370,15 @@ export default function App() {
               path: e.path,
               side: null,
               anchorIndex: anchorIndex >= 0 ? anchorIndex : undefined,
+            });
+          } else if (termIndex >= 0 || e.path === "term_pairs") {
+            // Term-pair failure: keep notes, anchors and every declared
+            // term, flag the single conflicting pair, show no new timeline.
+            setError({
+              message: e.message,
+              path: e.path,
+              side: null,
+              termIndex: termIndex >= 0 ? termIndex : undefined,
             });
           } else {
             const side: Side = e.path.startsWith("right") ? "right" : "left";
@@ -338,6 +418,7 @@ export default function App() {
     setAnchors([]);
     setSelLeft(null);
     setSelRight(null);
+    setTermPairs([]);
     setError(null);
     setResult(null);
     setRevealed(0);
@@ -350,6 +431,7 @@ export default function App() {
     setAnchors([]);
     setSelLeft(null);
     setSelRight(null);
+    setTermPairs([]);
     setError(null);
     setResult(null);
     setRevealed(0);
@@ -370,6 +452,8 @@ export default function App() {
 
   const flaggedAnchorIndex =
     error && error.path.startsWith("anchors") ? error.anchorIndex ?? -1 : -1;
+  const flaggedTermIndex =
+    error && error.path.startsWith("term_pairs") ? error.termIndex ?? -1 : -1;
 
   return (
     <main className="page">
@@ -418,6 +502,13 @@ export default function App() {
         selRight={selRight}
         onPick={handlePick}
         onRemove={removeAnchor}
+      />
+
+      <TermPairPanel
+        termPairs={termPairs}
+        errorIndex={flaggedTermIndex}
+        onAdd={addTermPair}
+        onRemove={removeTermPair}
       />
 
       <section className="controls">

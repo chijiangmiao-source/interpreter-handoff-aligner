@@ -11,7 +11,6 @@ const ORIGIN_LABEL: Record<NonNullable<AlignStep["origin"]>, string> = {
   anchor: "人工锚点",
   auto: "算法生成",
 };
-
 function n(v: Int): string {
   return typeof v === "bigint" ? v.toString() : String(v);
 }
@@ -55,6 +54,9 @@ function costExplanation(step: AlignStep): string {
   const lt = step.left!.time;
   const rt = step.right!.time;
   const diff = absDiff(lt, rt);
+  if (step.term_pair) {
+    return `术语等价「${step.term_pair.left_text} ≡ ${step.term_pair.right_text}」：|${n(lt)} − ${n(rt)}| = ${diff}（免除 3000）`;
+  }
   const same = step.left!.text === step.right!.text;
   if (same) {
     return `相同文本：|${n(lt)} − ${n(rt)}| = ${diff}`;
@@ -97,6 +99,12 @@ export default function ResultTimeline({
           <span className="legend-anchors" data-testid="legend-anchors">
             {" "}本次含 {result.anchors.length} 个人工锚点，标记为「人工锚点」的行固定入列，
             其余行为各区间内动态规划生成，逐步复算仍汇总到同一总代价。
+          </span>
+        )}
+        {result.term_pairs && result.term_pairs.length > 0 && (
+          <span className="legend-terms" data-testid="legend-terms">
+            {" "}本次声明 {result.term_pairs.length} 对术语对应，标记为「术语等价」的配对
+            完全命中文本对应并免除 3000 文本不一致罚分，其余规则不变。
           </span>
         )}
       </p>
@@ -163,6 +171,7 @@ export default function ResultTimeline({
                   className={[
                     `row-${step.action}`,
                     step.origin === "anchor" ? "row-anchor" : "",
+                    step.term_pair ? "row-term" : "",
                     divergenceVisible && idx === divergence ? "row-divergence" : "",
                   ]
                     .filter(Boolean)
@@ -170,6 +179,7 @@ export default function ResultTimeline({
                   data-testid="timeline-row"
                   data-action={step.action}
                   data-origin={step.origin ?? ""}
+                  data-term-hit={step.term_pair ? "true" : "false"}
                 >
                   <td className="idx">{idx + 1}</td>
                   <td className="note-cell">
@@ -205,7 +215,17 @@ export default function ResultTimeline({
                       >
                         {ORIGIN_LABEL[step.origin]}
                       </span>
-                    ) : (
+                    ) : null}
+                    {step.term_pair ? (
+                      <span
+                        className="origin-tag tag-origin-term"
+                        data-testid="step-term"
+                        title={`${step.term_pair.left_text} ≡ ${step.term_pair.right_text}`}
+                      >
+                        术语等价
+                      </span>
+                    ) : null}
+                    {!step.origin && !step.term_pair && (
                       <span className="origin-tag origin-none">—</span>
                     )}
                   </td>
@@ -215,7 +235,9 @@ export default function ResultTimeline({
                   <td className="cumulative" data-testid="step-cumulative">
                     {n(step.cumulative_cost)}
                   </td>
-                  <td className="explain">{costExplanation(step)}</td>
+                  <td className="explain" data-testid="step-explain">
+                    {costExplanation(step)}
+                  </td>
                 </tr>
                 {divergenceVisible && idx === divergence && (
                   <AlternativeRow alternative={alternative!} index={idx} />
@@ -287,6 +309,15 @@ function AlternativeRow({
       </td>
       <td className="origin-cell alt-cell" colSpan={1}>
         <span className="alt-label">严格次优</span>
+        {step.term_pair && (
+          <span
+            className="origin-tag tag-origin-term"
+            data-testid="alternative-step-term"
+            title={`${step.term_pair.left_text} ≡ ${step.term_pair.right_text}`}
+          >
+            术语等价
+          </span>
+        )}
       </td>
       <td className="cost alt-cell" data-testid="alternative-step-cost">
         {n(step.cost)}

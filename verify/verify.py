@@ -375,6 +375,171 @@ def run_compare_alternative_checks(left, right, free_body) -> None:
     )
 
 
+def run_term_pair_checks() -> None:
+    """Acceptance for the lead-declared term correspondences."""
+    # Opening texts genuinely differ (penalized for free); the rest mirrors
+    # the golden handoff (one equal-text match plus a tail gap-order tie), so
+    # anchors and the alternative path are exercised under the term rule.
+    left = [
+        {"time": 0, "text": "人工智能"},
+        {"time": 4200, "text": "新产品将于下月上市"},
+        {"time": 9000, "text": "感谢各位的提问"},
+    ]
+    right = [
+        {"time": 100, "text": "AI"},
+        {"time": 4100, "text": "新产品将于下月上市"},
+        {"time": 12000, "text": "交接后的补充记录"},
+    ]
+    base = {"left": left, "right": right}
+    terms = [{"left_text": "人工智能", "right_text": "AI"}]
+
+    # Guarantee 1: absent / empty term_pairs keep the exact legacy result.
+    status, free_body = http("POST", f"{API_URL}/api/align", base)
+    check(
+        "terms: free response has no term_pairs field and no row markers",
+        status == 200
+        and "term_pairs" not in free_body
+        and all("term_pair" not in s for s in free_body["steps"]),
+        f"body={free_body}",
+    )
+    status, body_empty = http(
+        "POST", f"{API_URL}/api/align", {**base, "term_pairs": []}
+    )
+    check(
+        "terms: empty term_pairs array equals the legacy result",
+        status == 200 and body_empty == free_body,
+    )
+
+    # Guarantee 2: the main flow — the lead adds the translation
+    # correspondence, aligns, and the mismatch penalty is waived exactly on
+    # the exact-hit pairing; per-step recomputation still totals the result.
+    status, body = http(
+        "POST", f"{API_URL}/api/align", {**base, "term_pairs": terms}
+    )
+    check(
+        "terms: declared correspondence is echoed back",
+        status == 200 and body.get("term_pairs") == terms,
+        f"body={body}",
+    )
+    hit_rows = [s for s in body["steps"] if "term_pair" in s]
+    check(
+        "terms: exactly the exact-hit pairing is marked 术语等价",
+        len(hit_rows) == 1
+        and hit_rows[0]["action"] == "match"
+        and hit_rows[0]["left"]["text"] == "人工智能"
+        and hit_rows[0]["right"]["text"] == "AI"
+        and hit_rows[0]["term_pair"] == terms[0]
+        and hit_rows[0]["cost"] == 100,
+        f"hit_rows={hit_rows}",
+    )
+    check(
+        "terms: penalty is accurately waived (|dt|, no +3000) and steps replay",
+        body["total_cost"] == free_body["total_cost"] - MISMATCH == 4200
+        and [s["cost"] for s in body["steps"]] == [100, 100, 2000, 2000]
+        and [s["cumulative_cost"] for s in body["steps"]]
+        == [100, 200, 2200, 4200]
+        and sum(s["cost"] for s in body["steps"]) == body["total_cost"],
+        f"total={body.get('total_cost')} free={free_body['total_cost']}",
+    )
+    # Equal-text matches and gap rows keep their original source presentation.
+    check(
+        "terms: non-hit rows keep their original source presentation",
+        all("term_pair" not in s for s in body["steps"][1:]),
+    )
+    # A substring (non-verbatim) declaration never hits.
+    status, near_miss = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {**base, "term_pairs": [{"left_text": "人工", "right_text": "AI"}]},
+    )
+    check(
+        "terms: a near miss keeps the mismatch penalty (legacy total)",
+        status == 200
+        and near_miss["total_cost"] == free_body["total_cost"]
+        and all("term_pair" not in s for s in near_miss["steps"]),
+        f"body={near_miss}",
+    )
+
+    # Guarantee 3: anchors and the alternative path both adopt the term rule.
+    status, combined = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            **base,
+            "anchors": [{"left": 0, "right": 0}],
+            "term_pairs": terms,
+            "compare_alternative": True,
+        },
+    )
+    anchor_rows = [s for s in combined["steps"] if s.get("origin") == "anchor"]
+    alt_anchor_rows = [
+        s for s in combined.get("alternative", {}).get("steps", [])
+        if s.get("origin") == "anchor"
+    ]
+    check(
+        "terms: a forced anchor on the synonym waives its penalty too",
+        status == 200
+        and len(anchor_rows) == 1
+        and anchor_rows[0]["cost"] == 100
+        and anchor_rows[0]["term_pair"] == terms[0],
+        f"combined={combined}",
+    )
+    check(
+        "terms: anchors and the alternative share the term rule",
+        combined.get("alternative") is not None
+        and combined["alternative"]["cost_diff"] == 0
+        and alt_anchor_rows == anchor_rows
+        and any(
+            s.get("term_pair") == terms[0]
+            for s in combined["alternative"]["steps"]
+        ),
+        f"alternative={combined.get('alternative')}",
+    )
+
+    # Guarantee 4: a same-side duplicate mapping fails exactly once, on the
+    # first conflicting entry, no matter how many later entries also clash.
+    conflict_terms = [
+        {"left_text": "人工智能", "right_text": "AI"},
+        {"left_text": "人工智能", "right_text": "ML"},
+        {"left_text": "机器学习", "right_text": "AI"},
+    ]
+    status, body = http(
+        "POST", f"{API_URL}/api/align",
+        {**base, "term_pairs": conflict_terms},
+    )
+    check(
+        "terms: duplicate left mapping fails once at term_pairs[1].left_text",
+        status == 422
+        and set(body) == {"error", "path"}
+        and body["path"] == "term_pairs[1].left_text"
+        and "steps" not in body,
+        f"body={body}",
+    )
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            **base,
+            "term_pairs": [
+                {"left_text": "人工智能", "right_text": "AI"},
+                {"left_text": "机器学习", "right_text": "AI"},
+            ],
+        },
+    )
+    check(
+        "terms: duplicate right mapping fails once at term_pairs[1].right_text",
+        status == 422 and body["path"] == "term_pairs[1].right_text",
+        f"body={body}",
+    )
+
+    # Guarantee 5: deleting every term pair restores the original result.
+    status, restored = http("POST", f"{API_URL}/api/align", base)
+    check(
+        "terms: deleting all term pairs restores the original result",
+        status == 200 and restored == free_body,
+    )
+
+
 def main() -> int:
     # 1. API health
     status, body = http("GET", f"{API_URL}/health")
@@ -638,6 +803,9 @@ def main() -> int:
 
     # 9. Strictly second-best alternative path comparison.
     run_compare_alternative_checks(left, right, first)
+
+    # 10. Lead-declared term correspondences (synonym pairs).
+    run_term_pair_checks()
 
     print(f"\n{checks - len(failures)}/{checks} checks passed.")
     if failures:

@@ -813,3 +813,344 @@ describe("App", () => {
     vi.unstubAllGlobals();
   });
 });
+
+// Term-aware alignment: a lead-declared synonym correspondence waives the
+// mismatch penalty on exact hits, marked in the timeline as "术语等价".
+const termBody = {
+  steps: [
+    {
+      action: "match",
+      left: { time: 0, text: "人工智能" },
+      right: { time: 100, text: "AI" },
+      cost: 100,
+      cumulative_cost: 100,
+      term_pair: { left_text: "人工智能", right_text: "AI" },
+    },
+    {
+      action: "match",
+      left: { time: 9000, text: "结束语" },
+      right: { time: 9200, text: "结束语" },
+      cost: 200,
+      cumulative_cost: 300,
+    },
+  ],
+  total_cost: 300,
+  counts: { match: 2, left_gap: 0, right_gap: 0 },
+  costs: { gap: 2000, mismatch_penalty: 3000 },
+  term_pairs: [{ left_text: "人工智能", right_text: "AI" }],
+};
+
+const termNotes = {
+  left: [
+    { time: 0, text: "人工智能" },
+    { time: 9000, text: "结束语" },
+  ],
+  right: [
+    { time: 100, text: "AI" },
+    { time: 9200, text: "结束语" },
+  ],
+};
+
+describe("App: term pairs", () => {
+  it("renders the term panel with an empty state", () => {
+    render(<App />);
+    expect(screen.getByTestId("term-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("term-empty")).toBeInTheDocument();
+    expect(screen.queryAllByTestId("term-item")).toHaveLength(0);
+  });
+
+  it("adds a term pair from the two inputs and removes it", () => {
+    render(<App />);
+    fireEvent.change(screen.getByTestId("term-input-left"), {
+      target: { value: " 人工智能 " },
+    });
+    fireEvent.change(screen.getByTestId("term-input-right"), {
+      target: { value: "AI" },
+    });
+    fireEvent.click(screen.getByTestId("term-add"));
+
+    const items = screen.getAllByTestId("term-item");
+    expect(items).toHaveLength(1);
+    // Drafts are trimmed when stored and cleared after adding.
+    expect(items[0]).toHaveTextContent("人工智能");
+    expect(items[0]).toHaveTextContent("AI");
+    expect((screen.getByTestId("term-input-left") as HTMLInputElement).value).toBe(
+      "",
+    );
+
+    fireEvent.click(screen.getByTestId("term-remove-0"));
+    expect(screen.queryAllByTestId("term-item")).toHaveLength(0);
+    expect(screen.getByTestId("term-empty")).toBeInTheDocument();
+  });
+
+  it("keeps a conflicting term pair and flags the first conflict once", () => {
+    render(<App />);
+    const add = (l: string, r: string) => {
+      fireEvent.change(screen.getByTestId("term-input-left"), {
+        target: { value: l },
+      });
+      fireEvent.change(screen.getByTestId("term-input-right"), {
+        target: { value: r },
+      });
+      fireEvent.click(screen.getByTestId("term-add"));
+    };
+    add("人工智能", "AI");
+    add("人工智能", "机器学习");
+
+    const items = screen.getAllByTestId("term-item");
+    // The conflicting candidate is kept, not silently dropped.
+    expect(items).toHaveLength(2);
+    expect(items[1]).toHaveClass("invalid");
+    expect(items[0]).not.toHaveClass("invalid");
+    expect(screen.getByTestId("term-error")).toBeInTheDocument();
+    expect(screen.getByTestId("error-path").textContent).toContain(
+      "term_pairs[1].left_text",
+    );
+    // Exactly one banner.
+    expect(screen.getAllByTestId("error-banner")).toHaveLength(1);
+    // No possibly-valid timeline.
+    expect(screen.queryByTestId("result-panel")).toBeNull();
+
+    // Removing the offending pair clears the flag.
+    fireEvent.click(screen.getByTestId("term-remove-1"));
+    expect(screen.queryByTestId("error-banner")).toBeNull();
+    expect(screen.queryByTestId("term-error")).toBeNull();
+  });
+
+  it("blocks submit locally on a term conflict without calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+    render(<App />);
+    const add = (l: string, r: string) => {
+      fireEvent.change(screen.getByTestId("term-input-left"), {
+        target: { value: l },
+      });
+      fireEvent.change(screen.getByTestId("term-input-right"), {
+        target: { value: r },
+      });
+      fireEvent.click(screen.getByTestId("term-add"));
+    };
+    add("a", "x");
+    add("a", "y");
+    fireEvent.click(screen.getByTestId("submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("error-banner")).toBeInTheDocument(),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("error-path").textContent).toContain(
+      "term_pairs[1].left_text",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("sends term_pairs and shows the 术语等价 source and replay formula", async () => {
+    let sentBody = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sentBody = init!.body as string;
+        return new Response(JSON.stringify(termBody), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    render(<App />);
+    fireEvent.change(screen.getByTestId("input-left"), {
+      target: { value: JSON.stringify(termNotes.left) },
+    });
+    fireEvent.change(screen.getByTestId("input-right"), {
+      target: { value: JSON.stringify(termNotes.right) },
+    });
+    fireEvent.change(screen.getByTestId("term-input-left"), {
+      target: { value: "人工智能" },
+    });
+    fireEvent.change(screen.getByTestId("term-input-right"), {
+      target: { value: "AI" },
+    });
+    fireEvent.click(screen.getByTestId("term-add"));
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    expect(sentBody).toContain(
+      `"term_pairs":[{"left_text":"人工智能","right_text":"AI"}]`,
+    );
+
+    const rows = screen.getAllByTestId("timeline-row");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveAttribute("data-term-hit", "true");
+    expect(rows[1]).toHaveAttribute("data-term-hit", "false");
+    const termTags = screen.getAllByTestId("step-term");
+    expect(termTags).toHaveLength(1);
+    expect(termTags[0].textContent).toBe("术语等价");
+    // The non-hit equal-text row keeps the ordinary dash source.
+    expect(screen.queryAllByTestId("step-origin")).toHaveLength(0);
+    // Waived penalty: cost 100, replay formula states the equivalence.
+    expect(screen.getAllByTestId("step-cost")[0].textContent).toBe("100");
+    expect(screen.getAllByTestId("step-explain")[0].textContent).toMatch(
+      /术语等价/,
+    );
+    expect(screen.getByTestId("legend-terms")).toBeInTheDocument();
+    expect(screen.getByTestId("total-cost").textContent).toBe("300");
+    vi.unstubAllGlobals();
+  });
+
+  it("omits term_pairs from the request when all pairs are deleted", async () => {
+    let sentBody = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sentBody = init!.body as string;
+        return new Response(JSON.stringify(okBody), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    render(<App />);
+    fireEvent.change(screen.getByTestId("term-input-left"), {
+      target: { value: "人工智能" },
+    });
+    fireEvent.change(screen.getByTestId("term-input-right"), {
+      target: { value: "AI" },
+    });
+    fireEvent.click(screen.getByTestId("term-add"));
+    expect(screen.getAllByTestId("term-item")).toHaveLength(1);
+    // Delete every term pair: the legacy request must be restored.
+    fireEvent.click(screen.getByTestId("term-remove-0"));
+    fireEvent.click(screen.getByTestId("submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    expect(sentBody).not.toContain("term_pairs");
+    // Unmarked rows carry no term source.
+    expect(screen.queryAllByTestId("step-term")).toHaveLength(0);
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps notes and term rows on a term 422 and flags the conflict row", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockFetchOnce(
+        {
+          error: "同一侧术语不可重复对应。",
+          path: "term_pairs[1].left_text",
+        },
+        422,
+      ),
+    );
+    render(<App />);
+    // Two locally-valid pairs (the server-side conflict simulates a race).
+    for (const [l, r] of [
+      ["a", "x"],
+      ["b", "y"],
+    ]) {
+      fireEvent.change(screen.getByTestId("term-input-left"), {
+        target: { value: l },
+      });
+      fireEvent.change(screen.getByTestId("term-input-right"), {
+        target: { value: r },
+      });
+      fireEvent.click(screen.getByTestId("term-add"));
+    }
+    const leftBefore = (screen.getByTestId("input-left") as HTMLTextAreaElement)
+      .value;
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("error-banner")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("error-path").textContent).toContain(
+      "term_pairs[1].left_text",
+    );
+    // Inputs and both term rows are preserved; no new timeline is shown.
+    expect((screen.getByTestId("input-left") as HTMLTextAreaElement).value).toBe(
+      leftBefore,
+    );
+    expect(screen.getAllByTestId("term-item")).toHaveLength(2);
+    expect(screen.getAllByTestId("term-item")[1]).toHaveClass("invalid");
+    expect(screen.getByTestId("term-error")).toBeInTheDocument();
+    expect(screen.queryByTestId("result-panel")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  it("sends anchors, term pairs and compare together and marks term alt rows", async () => {
+    // Distant term-equivalent notes: the optimum gaps both sides (4000),
+    // while the strict runner-up is the synonym match (9000), so the single
+    // expansion row under primary row 0 is a term-hit pairing.
+    const notes = {
+      left: [{ time: 0, text: "人工智能" }],
+      right: [{ time: 9000, text: "AI" }],
+    };
+    const body = {
+      steps: [
+        {
+          action: "right_gap",
+          left: { time: 0, text: "人工智能" },
+          right: null,
+          cost: 2000,
+          cumulative_cost: 2000,
+        },
+        {
+          action: "left_gap",
+          left: null,
+          right: { time: 9000, text: "AI" },
+          cost: 2000,
+          cumulative_cost: 4000,
+        },
+      ],
+      total_cost: 4000,
+      counts: { match: 0, left_gap: 1, right_gap: 1 },
+      costs: { gap: 2000, mismatch_penalty: 3000 },
+      term_pairs: [{ left_text: "人工智能", right_text: "AI" }],
+      alternative: {
+        steps: [
+          {
+            action: "match",
+            left: { time: 0, text: "人工智能" },
+            right: { time: 9000, text: "AI" },
+            cost: 9000,
+            cumulative_cost: 9000,
+            term_pair: { left_text: "人工智能", right_text: "AI" },
+          },
+        ],
+        total_cost: 9000,
+        cost_diff: 5000,
+        first_divergence: { left: 0, right: 0 },
+      },
+    };
+    vi.stubGlobal("fetch", mockFetchOnce(body));
+    render(<App />);
+    fireEvent.change(screen.getByTestId("input-left"), {
+      target: { value: JSON.stringify(notes.left) },
+    });
+    fireEvent.change(screen.getByTestId("input-right"), {
+      target: { value: JSON.stringify(notes.right) },
+    });
+    fireEvent.change(screen.getByTestId("term-input-left"), {
+      target: { value: "人工智能" },
+    });
+    fireEvent.change(screen.getByTestId("term-input-right"), {
+      target: { value: "AI" },
+    });
+    fireEvent.click(screen.getByTestId("term-add"));
+    fireEvent.click(screen.getByTestId("compare-alternative"));
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("alternative-summary")).toBeInTheDocument(),
+    );
+    // The primary timeline carries no term tag (both rows are gaps), and the
+    // single expansion row for the strict runner-up carries the term source.
+    expect(screen.queryAllByTestId("step-term")).toHaveLength(0);
+    expect(screen.getByTestId("alternative-step-term")).toHaveTextContent(
+      "术语等价",
+    );
+    expect(screen.getByTestId("alternative-row-gap").textContent).toContain(
+      "成本差 +5000",
+    );
+    vi.unstubAllGlobals();
+  });
+});

@@ -567,3 +567,221 @@ test("live API: valid anchors fix the pairs, crossing fails once, cancelling res
   const restored = await request.post("/api/align", { data: payload });
   expect(await restored.json()).toEqual(freeBody);
 });
+
+// --------------------------------------------------------------------------- //
+// Lead-declared term correspondences (term_pairs).
+// --------------------------------------------------------------------------- //
+
+test.describe("term pairs", () => {
+  test("lead adds a term correspondence, penalty is waived and rows are tagged", async ({
+    page,
+  }) => {
+    const left = JSON.stringify([
+      { time: 0, text: "人工智能" },
+      { time: 9000, text: "结束语" },
+    ]);
+    const right = JSON.stringify([
+      { time: 100, text: "AI" },
+      { time: 9200, text: "结束语" },
+    ]);
+    await page.getByTestId("input-left").fill(left);
+    await page.getByTestId("input-right").fill(right);
+
+    // Before declaring the correspondence, mismatching text would cost +3000.
+    await page.getByTestId("submit").click();
+    await expect(page.getByTestId("result-panel")).toBeVisible();
+    await expect(page.getByTestId("total-cost")).toHaveText("3300");
+
+    // Declare 人工智能 <-> AI, then realign.
+    await page
+      .getByTestId("term-input-left")
+      .fill(" 人工智能 "); // trimming is verified below
+    await page.getByTestId("term-input-right").fill("AI");
+    await page.getByTestId("term-add").click();
+    const items = page.getByTestId("term-item");
+    await expect(items).toHaveCount(1);
+    await expect(items.first()).toContainText("人工智能");
+    await expect(items.first()).toContainText("AI");
+
+    await page.getByTestId("submit").click();
+    await expect(page.getByTestId("result-panel")).toBeVisible();
+
+    const rows = page.getByTestId("timeline-row");
+    await expect(rows).toHaveCount(2);
+    await expect(rows.nth(0)).toHaveAttribute("data-term-hit", "true");
+    await expect(rows.nth(1)).toHaveAttribute("data-term-hit", "false");
+    // |0 - 100| = 100 with the 3000 mismatch penalty waived; totals replay.
+    await expect(page.getByTestId("step-cost").nth(0)).toHaveText("100");
+    await expect(page.getByTestId("step-cumulative").nth(0)).toHaveText("100");
+    await expect(page.getByTestId("step-cumulative").nth(1)).toHaveText("300");
+    await expect(page.getByTestId("total-cost")).toHaveText("300");
+    // The hit row's source is "术语等价" and its recomputation explains it.
+    await expect(page.getByTestId("step-term")).toHaveText("术语等价");
+    await expect(page.getByTestId("step-explain").nth(0)).toContainText(
+      "术语等价",
+    );
+    await expect(page.getByTestId("step-explain").nth(0)).toContainText("免除 3000");
+    await expect(page.getByTestId("legend-terms")).toBeVisible();
+  });
+
+  test("deleting every term pair restores the original penalized result", async ({
+    page,
+  }) => {
+    const left = JSON.stringify([{ time: 0, text: "人工智能" }]);
+    const right = JSON.stringify([{ time: 100, text: "AI" }]);
+    await page.getByTestId("input-left").fill(left);
+    await page.getByTestId("input-right").fill(right);
+
+    await page.getByTestId("term-input-left").fill("人工智能");
+    await page.getByTestId("term-input-right").fill("AI");
+    await page.getByTestId("term-add").click();
+    await page.getByTestId("submit").click();
+    await expect(page.getByTestId("total-cost")).toHaveText("100");
+    await expect(page.getByTestId("step-term")).toHaveText("术语等价");
+
+    // Delete the only correspondence and realign: the 3000 penalty is back.
+    await page.getByTestId("term-remove-0").click();
+    await expect(page.getByTestId("term-item")).toHaveCount(0);
+    await page.getByTestId("submit").click();
+    await expect(page.getByTestId("result-panel")).toBeVisible();
+    await expect(page.getByTestId("total-cost")).toHaveText("3100");
+    expect(await page.getByTestId("step-term").count()).toBe(0);
+  });
+
+  test("a same-side duplicate mapping is flagged once and blocks no timeline", async ({
+    page,
+  }) => {
+    const addPair = async (l: string, r: string) => {
+      await page.getByTestId("term-input-left").fill(l);
+      await page.getByTestId("term-input-right").fill(r);
+      await page.getByTestId("term-add").click();
+    };
+    await addPair("人工智能", "AI");
+    await addPair("人工智能", "机器学习");
+    const items = page.getByTestId("term-item");
+    await expect(items).toHaveCount(2);
+    await expect(items.nth(1)).toHaveClass(/invalid/);
+    await expect(page.getByTestId("error-path")).toContainText(
+      "term_pairs[1].left_text",
+    );
+    // The candidate stays listed and no result is shown.
+    expect(await page.getByTestId("result-panel").count()).toBe(0);
+
+    // Removing the conflicting row clears the single error.
+    await page.getByTestId("term-remove-1").click();
+    await expect(page.getByTestId("error-banner")).toHaveCount(0);
+  });
+});
+
+test("live API: term pairs waive the penalty only on exact hits and stay legacy-compatible", async ({
+  request,
+}) => {
+  const payload = {
+    left: [
+      { time: 0, text: "人工智能" },
+      { time: 9000, text: "结束语" },
+    ],
+    right: [
+      { time: 100, text: "AI" },
+      { time: 9200, text: "结束语" },
+    ],
+  };
+
+  // 1) Legacy requests (absent and empty array) are identical and carry no
+  //    term fields.
+  const legacy = await (await request.post("/api/align", { data: payload })).text();
+  expect(legacy).not.toContain("term_pairs");
+  const empty = await (
+    await request.post("/api/align", { data: { ...payload, term_pairs: [] } })
+  ).text();
+  expect(empty).toBe(legacy);
+
+  // 2) An exact hit waives the 3000 penalty and tags that match row only.
+  const hit = await (
+    await request.post("/api/align", {
+      data: {
+        ...payload,
+        term_pairs: [{ left_text: "人工智能", right_text: "AI" }],
+      },
+    })
+  ).json();
+  expect(hit.total_cost).toBe(300);
+  expect(hit.term_pairs).toEqual([
+    { left_text: "人工智能", right_text: "AI" },
+  ]);
+  expect(hit.steps[0].cost).toBe(100);
+  expect(hit.steps[0].term_pair).toEqual({
+    left_text: "人工智能",
+    right_text: "AI",
+  });
+  expect("term_pair" in hit.steps[1]).toBe(false);
+
+  // 3) A near miss (substring, not verbatim) keeps the mismatch penalty.
+  const miss = await (
+    await request.post("/api/align", {
+      data: {
+        ...payload,
+        term_pairs: [{ left_text: "人工", right_text: "AI" }],
+      },
+    })
+  ).json();
+  expect(miss.total_cost).toBe(3300);
+  expect("term_pair" in miss.steps[0]).toBe(false);
+
+  // 4) A same-side duplicate mapping fails exactly once.
+  const conflict = await request.post("/api/align", {
+    data: {
+      left: [],
+      right: [],
+      term_pairs: [
+        { left_text: "a", right_text: "x" },
+        { left_text: "a", right_text: "y" },
+      ],
+    },
+  });
+  expect(conflict.status()).toBe(422);
+  const conflictBody = await conflict.json();
+  expect(Object.keys(conflictBody).sort()).toEqual(["error", "path"]);
+  expect(conflictBody.path).toBe("term_pairs[1].left_text");
+
+  // 5) The term rule applies together with anchors and the alternative.
+  const golden = {
+    left: [
+      { time: 0, text: "g" },
+      { time: 4200, text: "p" },
+      { time: 9000, text: "t" },
+    ],
+    right: [
+      { time: 150, text: "G" },
+      { time: 4100, text: "P" },
+      { time: 12000, text: "h" },
+    ],
+  };
+  const combined = await (
+    await request.post("/api/align", {
+      data: {
+        ...golden,
+        anchors: [{ left: 0, right: 0 }],
+        term_pairs: [
+          { left_text: "g", right_text: "G" },
+          { left_text: "p", right_text: "P" },
+        ],
+        compare_alternative: true,
+      },
+    })
+  ).json();
+  const anchorRow = combined.steps.find(
+    (s: { origin?: string }) => s.origin === "anchor",
+  );
+  expect(anchorRow.cost).toBe(150);
+  expect(anchorRow.term_pair).toEqual({ left_text: "g", right_text: "G" });
+  // The tail gap-order tie keeps a runner-up; it is ranked under the same
+  // synonym cost, and the forced anchor row is identical in both paths.
+  expect(combined.alternative).not.toBeNull();
+  expect(combined.alternative.cost_diff).toBe(0);
+  const altAnchor = combined.alternative.steps.find(
+    (s: { origin?: string }) => s.origin === "anchor",
+  );
+  expect(altAnchor.term_pair).toEqual({ left_text: "g", right_text: "G" });
+  expect(altAnchor).toEqual(anchorRow);
+});

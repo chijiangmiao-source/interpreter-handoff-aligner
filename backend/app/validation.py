@@ -144,3 +144,57 @@ def validate_anchors(
         prev_left, prev_right = li, ri
 
     return None, None
+
+
+def validate_term_pairs(term_pairs: Any) -> tuple[str | None, str | None]:
+    """Validate the optional ``term_pairs`` array of text correspondences.
+
+    Each entry must be an object containing only a non-empty string
+    ``left_text`` and a non-empty string ``right_text``.  A term may be
+    mapped at most once on each side: the second entry reusing an already
+    mapped left_text (or right_text) is a conflict.  Exactly one failure is
+    produced — term pairs are examined in submission order and the first
+    conflict wins, with its path, e.g. ``term_pairs[1].right_text``.
+
+    Returns ``(error_path, error_message)``; on success both are ``None``.
+    """
+    if not isinstance(term_pairs, list):
+        return "term_pairs", "term_pairs 必须是数组。"
+
+    seen_left: set[str] = set()
+    seen_right: set[str] = set()
+
+    for k, pair in enumerate(term_pairs):
+        base = f"term_pairs[{k}]"
+
+        if not isinstance(pair, dict):
+            return base, f"{base} 必须是包含 left_text 与 right_text 的对象。"
+
+        # Reject unknown keys up front so a typo is not silently ignored.
+        extra = [
+            key for key in pair if key not in ("left_text", "right_text")
+        ]
+        if extra:
+            return f"{base}.{extra[0]}", f"{base}.{extra[0]} 是多余字段。"
+
+        for field, seen in (
+            ("left_text", seen_left),
+            ("right_text", seen_right),
+        ):
+            if field not in pair:
+                return f"{base}.{field}", f"{base} 缺少非空字符串字段 {field}。"
+            value = pair[field]
+            if not isinstance(value, str):
+                return f"{base}.{field}", f"{base}.{field} 必须是非空字符串。"
+            if len(value) == 0:
+                return f"{base}.{field}", f"{base}.{field} 不可为空字符串。"
+            if value in seen:
+                return (
+                    f"{base}.{field}",
+                    f"{base}.{field} 「{value}」已映射过，同一侧术语不可重复对应。",
+                )
+
+        seen_left.add(pair["left_text"])
+        seen_right.add(pair["right_text"])
+
+    return None, None
