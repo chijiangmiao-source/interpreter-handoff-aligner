@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import HighlightedTextarea from "./HighlightedTextarea";
 import ResultTimeline from "./ResultTimeline";
-import { alignNotes, AlignRequestError } from "./api";
+import { alignNotes, rootRawText, AlignRequestError } from "./api";
 import {
   JsonSourceError,
   locateOffset,
@@ -9,7 +9,7 @@ import {
   type Range,
 } from "./jsonLocations";
 import { validateSequence } from "./validation";
-import type { AlignResponse, Note } from "./types";
+import type { AlignResponse, Int } from "./types";
 
 type Side = "left" | "right";
 
@@ -119,11 +119,12 @@ export default function App() {
       }
 
       // --- Phase 3: the server performs the DP alignment ------------------
+      // The raw array source is forwarded verbatim so integer literals
+      // beyond Number.MAX_SAFE_INTEGER keep their exact digits.
+      const leftRaw = rootRawText(leftText);
+      const rightRaw = rootRawText(rightText);
       try {
-        const aligned = await alignNotes(
-          leftParsed.value as Note[],
-          rightParsed.value as Note[],
-        );
+        const aligned = await alignNotes(leftRaw, rightRaw);
         setResult(aligned);
         setRevealed(aligned.steps.length);
       } catch (e) {
@@ -181,7 +182,7 @@ export default function App() {
     return { ...result, steps: result.steps.slice(0, revealed) };
   }, [result, revealed]);
 
-  const runningTotal =
+  const runningTotal: Int =
     visibleResult && visibleResult.steps.length > 0
       ? visibleResult.steps[visibleResult.steps.length - 1].cumulative_cost
       : 0;
@@ -249,7 +250,7 @@ export default function App() {
               ◀ 上一步
             </button>
             <span data-testid="replay-count">
-              复算 {revealed} / {result.steps.length} 步 · 当前累计 {runningTotal}
+              复算 {revealed} / {result.steps.length} 步 · 当前累计 {String(runningTotal)}
             </span>
             <button
               type="button"

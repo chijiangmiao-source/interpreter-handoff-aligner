@@ -22,15 +22,15 @@ const okBody = {
     },
     {
       action: "right_gap",
-      left: null,
-      right: { time: 12000, text: "交接后的补充记录" },
+      left: { time: 9000, text: "感谢各位的提问" },
+      right: null,
       cost: 2000,
       cumulative_cost: 2250,
     },
     {
       action: "left_gap",
-      left: { time: 9000, text: "感谢各位的提问" },
-      right: null,
+      left: null,
+      right: { time: 12000, text: "交接后的补充记录" },
       cost: 2000,
       cumulative_cost: 4250,
     },
@@ -69,6 +69,8 @@ describe("App", () => {
     const rows = screen.getAllByTestId("timeline-row");
     expect(rows).toHaveLength(4);
     expect(rows[0]).toHaveAttribute("data-action", "match");
+    // Row 2 keeps the left 9000 note with the right side blank -> right_gap;
+    // row 3 keeps the right 12000 note with the left side blank -> left_gap.
     expect(rows[2]).toHaveAttribute("data-action", "right_gap");
     expect(rows[3]).toHaveAttribute("data-action", "left_gap");
     expect(screen.getByTestId("total-cost")).toHaveTextContent("4250");
@@ -182,5 +184,62 @@ describe("App", () => {
     fireEvent.click(screen.getByTestId("clear"));
     expect((screen.getByTestId("input-left") as HTMLTextAreaElement).value).toBe("[]");
     expect((screen.getByTestId("input-right") as HTMLTextAreaElement).value).toBe("[]");
+  });
+
+  it("handles huge increasing timestamps (beyond safe integers) without a false duplicate", async () => {
+    let sentBody = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sentBody = init!.body as string;
+        // Response timestamps are small here; this case only checks the
+        // request forwarding and that local validation does not flag the
+        // two huge, double-colliding input times as duplicates.
+        return new Response(
+          JSON.stringify({
+            steps: [
+              {
+                action: "right_gap",
+                left: { time: 9007199254740992, text: "a" },
+                right: null,
+                cost: 2000,
+                cumulative_cost: 2000,
+              },
+              {
+                action: "right_gap",
+                left: { time: 9007199254740996, text: "b" },
+                right: null,
+                cost: 2000,
+                cumulative_cost: 4000,
+              },
+            ],
+            total_cost: 4000,
+            counts: { match: 0, left_gap: 0, right_gap: 2 },
+            costs: { gap: 2000, mismatch_penalty: 3000 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    render(<App />);
+    fireEvent.change(screen.getByTestId("input-left"), {
+      target: {
+        value: `[\n  {"time": 9007199254740993, "text": "a"},\n  {"time": 9007199254740995, "text": "b"}\n]`,
+      },
+    });
+    fireEvent.change(screen.getByTestId("input-right"), {
+      target: { value: "[]" },
+    });
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    // No validation banner despite the double-precision collision.
+    expect(screen.queryByTestId("error-banner")).toBeNull();
+    // Exact digits were forwarded verbatim to the API.
+    expect(sentBody).toContain("9007199254740993");
+    expect(sentBody).toContain("9007199254740995");
+    vi.unstubAllGlobals();
   });
 });

@@ -1,5 +1,8 @@
+/** Numeric values may be exact BigInts (large integer literals) or numbers. */
+export type Int = number | bigint;
+
 export interface Note {
-  time: number;
+  time: Int;
   text: string;
 }
 
@@ -9,13 +12,13 @@ export interface AlignStep {
   action: Action;
   left: Note | null;
   right: Note | null;
-  cost: number;
-  cumulative_cost: number;
+  cost: Int;
+  cumulative_cost: Int;
 }
 
 export interface AlignResponse {
   steps: AlignStep[];
-  total_cost: number;
+  total_cost: Int;
   counts: { match: number; left_gap: number; right_gap: number };
   costs: { gap: number; mismatch_penalty: number };
 }

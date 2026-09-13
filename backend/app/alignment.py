@@ -10,13 +10,15 @@ the three edit operations are:
 * ``match``     pair left i-1 with right j-1.
                 cost = |tL - tR|               when texts are equal
                 cost = |tL - tR| + MISMATCH    when texts differ
-* ``left_gap``  left i-1 is kept, right contributes nothing (cost GAP)
-* ``right_gap`` right j-1 is kept, left contributes nothing (cost GAP)
+* ``left_gap``  the LEFT side is blank at this row: left contributes
+                nothing and right j-1 is kept (cost GAP)
+* ``right_gap`` the RIGHT side is blank at this row: right contributes
+                nothing and left i-1 is kept (cost GAP)
 
 ``align`` returns the unique, tie-broken minimum-cost path.  Where two or
 more predecessors share the optimum they are ranked
 
-    1. match      2. left_gap      3. right_gap
+    1. match      2. left_gap (left blank)      3. right_gap (right blank)
 
 and if actions themselves tie (impossible between distinct actions, but kept
 explicit) the predecessor coordinate that is lexicographically smallest
@@ -65,11 +67,13 @@ def align(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> dict[str, 
 
     dp[0][0] = 0
     for i in range(1, m + 1):
+        # Right side is empty along this border -> right_gap.
         dp[i][0] = dp[i - 1][0] + GAP_COST
-        chosen[i][0] = ACTION_LEFT_GAP
+        chosen[i][0] = ACTION_RIGHT_GAP
     for j in range(1, n + 1):
+        # Left side is empty along this border -> left_gap.
         dp[0][j] = dp[0][j - 1] + GAP_COST
-        chosen[0][j] = ACTION_RIGHT_GAP
+        chosen[0][j] = ACTION_LEFT_GAP
 
     for i in range(1, m + 1):
         li = left[i - 1]
@@ -80,11 +84,13 @@ def align(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> dict[str, 
                 0 if li["text"] == rj["text"] else MISMATCH_PENALTY
             )
 
-            # Predecessors, already in action-priority order.
+            # Predecessors, already in tie-break priority order
+            # (match, left-side gap, right-side gap). A move from (i, j-1)
+            # consumes a right note, so the LEFT side is blank there.
             candidates = [
                 (dp[i - 1][j - 1] + match_cost, ACTION_MATCH, i - 1, j - 1),
-                (dp[i - 1][j] + GAP_COST, ACTION_LEFT_GAP, i - 1, j),
-                (dp[i][j - 1] + GAP_COST, ACTION_RIGHT_GAP, i, j - 1),
+                (dp[i][j - 1] + GAP_COST, ACTION_LEFT_GAP, i, j - 1),
+                (dp[i - 1][j] + GAP_COST, ACTION_RIGHT_GAP, i - 1, j),
             ]
             best = min(candidates, key=lambda c: _candidate_rank(c[0], c[1], c[2], c[3]))
             dp[i][j] = best[0]
@@ -110,27 +116,28 @@ def align(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> dict[str, 
             )
             i, j = i - 1, j - 1
         elif action == ACTION_LEFT_GAP:
-            l = left[i - 1]
-            steps_rev.append(
-                {
-                    "action": ACTION_LEFT_GAP,
-                    "left": {"time": l["time"], "text": l["text"]},
-                    "right": None,
-                    "cost": GAP_COST,
-                }
-            )
-            i -= 1
-        else:  # ACTION_RIGHT_GAP
+            # Left side blank: the row carries the right-side note.
             r = right[j - 1]
             steps_rev.append(
                 {
-                    "action": ACTION_RIGHT_GAP,
+                    "action": ACTION_LEFT_GAP,
                     "left": None,
                     "right": {"time": r["time"], "text": r["text"]},
                     "cost": GAP_COST,
                 }
             )
             j -= 1
+        else:  # ACTION_RIGHT_GAP — right side blank, row carries left note
+            l = left[i - 1]
+            steps_rev.append(
+                {
+                    "action": ACTION_RIGHT_GAP,
+                    "left": {"time": l["time"], "text": l["text"]},
+                    "right": None,
+                    "cost": GAP_COST,
+                }
+            )
+            i -= 1
 
     steps = list(reversed(steps_rev))
 

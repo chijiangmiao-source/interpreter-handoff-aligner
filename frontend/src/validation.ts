@@ -5,6 +5,10 @@
  * object containing only an integer `time` (no booleans/floats) and a
  * non-empty string `text`; times must be strictly increasing.
  *
+ * Timestamps come out of the located JSON parser as `bigint` for integer
+ * literals (exact even beyond Number.MAX_SAFE_INTEGER) and as `number` for
+ * floats; both paths are handled without any precision loss.
+ *
  * The returned path is relative to the array itself ("[2].time", "" for the
  * root, "[200]" for the first item past the limit). Exactly one failure is
  * ever reported so the UI marks a single location.
@@ -23,7 +27,9 @@ export interface NoteInput {
   [k: string]: unknown;
 }
 
-function isPlainInt(v: unknown): v is number {
+/** Any JSON integer token: safe numbers or exact bigints from the parser. */
+function isIntToken(v: unknown): v is number | bigint {
+  if (typeof v === "bigint") return true;
   return typeof v === "number" && Number.isInteger(v) && !Number.isNaN(v);
 }
 
@@ -36,7 +42,7 @@ export function validateSequence(seq: unknown): ValidationIssue | null {
     return { path: `[${MAX_ITEMS}]`, message: `最多包含 ${MAX_ITEMS} 项。` };
   }
 
-  let prevTime: number | null = null;
+  let prevTime: bigint | null = null;
   for (let i = 0; i < seq.length; i++) {
     const item = seq[i] as unknown;
     const itemPath = `[${i}]`;
@@ -51,12 +57,13 @@ export function validateSequence(seq: unknown): ValidationIssue | null {
     if (!("time" in obj)) {
       return { path: `${itemPath}.time`, message: "缺少整数字段 time。" };
     }
-    if (typeof obj.time === "boolean" || !isPlainInt(obj.time)) {
+    if (typeof obj.time === "boolean" || !isIntToken(obj.time)) {
       return {
         path: `${itemPath}.time`,
         message: "必须是整数毫秒时间戳。",
       };
     }
+    const timeValue = BigInt(obj.time as number | bigint);
 
     if (!("text" in obj)) {
       return {
@@ -76,13 +83,13 @@ export function validateSequence(seq: unknown): ValidationIssue | null {
       };
     }
 
-    if (prevTime !== null && obj.time <= prevTime) {
+    if (prevTime !== null && timeValue <= prevTime) {
       return {
         path: `${itemPath}.time`,
-        message: `为 ${obj.time}，未严格递增（上一项时间为 ${prevTime}）。`,
+        message: `为 ${timeValue.toString()}，未严格递增（上一项时间为 ${prevTime.toString()}）。`,
       };
     }
-    prevTime = obj.time;
+    prevTime = timeValue;
   }
 
   return null;

@@ -51,6 +51,28 @@ describe("validateSequence", () => {
     expect(validateSequence([n(1), n(9), n(8)])?.path).toBe("[2].time");
   });
 
+  it("accepts huge strictly increasing integers without precision loss", () => {
+    // 2^53+1 and +3: ordinary JSON.parse rounds both to the same double.
+    const a = 9007199254740993n;
+    const b = 9007199254740995n;
+    expect(validateSequence([n(a), n(b)])).toBeNull();
+    // Two adjacent values that collide in double precision are still
+    // distinct bigints and must NOT be reported as duplicates.
+    expect(JSON.parse("[9007199254740993, 9007199254740995]")).toEqual([
+      9007199254740992,
+      9007199254740996,
+    ]);
+  });
+
+  it("still flags duplicate huge integers", () => {
+    const t = 9007199254740993n;
+    expect(validateSequence([n(t), n(t)])?.path).toBe("[1].time");
+  });
+
+  it("rejects float times even though they are numbers", () => {
+    expect(validateSequence([n(1.0), n(2.5)])?.path).toBe("[1].time");
+  });
+
   it("rejects unknown fields at item level", () => {
     expect(
       validateSequence([{ time: 1, text: "a", source: "A" }])?.path,

@@ -22,15 +22,19 @@ def test_empty_sequences_cost_zero():
 
 
 def test_one_side_empty_all_gaps():
+    # Only a left note: the RIGHT side is blank on that row -> right_gap.
     result = align([note(100, "a")], [])
-    assert result["steps"][0]["action"] == "left_gap"
+    assert result["steps"][0]["action"] == "right_gap"
     assert result["steps"][0]["cost"] == GAP_COST
     assert result["steps"][0]["left"] == note(100, "a")
     assert result["steps"][0]["right"] is None
     assert result["total_cost"] == GAP_COST
 
+    # Only a right note: the LEFT side is blank -> left_gap.
     result = align([], [note(100, "a")])
-    assert result["steps"][0]["action"] == "right_gap"
+    assert result["steps"][0]["action"] == "left_gap"
+    assert result["steps"][0]["left"] is None
+    assert result["steps"][0]["right"] == note(100, "a")
     assert result["total_cost"] == GAP_COST
 
 
@@ -53,33 +57,57 @@ def test_two_gaps_cheaper_than_big_time_difference():
     # |9000 - 0| = 9000 match > 2000 + 2000 = 4000 for a gap pair.
     result = align([note(0, "same")], [note(9000, "same")])
     actions = [s["action"] for s in result["steps"]]
+    # The left note comes first chronologically; its row has the right side
+    # blank (right_gap), then the right note sits on a left-blank row.
     assert actions == ["right_gap", "left_gap"]
+    assert result["steps"][0]["left"] == note(0, "same")
+    assert result["steps"][0]["right"] is None
+    assert result["steps"][1]["left"] is None
+    assert result["steps"][1]["right"] == note(9000, "same")
     assert result["total_cost"] == 2 * GAP_COST
 
 
 def test_tie_match_vs_two_gaps_prefers_match():
-    # Match 4000 ties with left+right gap 4000 -> match priority wins.
+    # Match 4000 ties with one left-gap + one right-gap (also 4000);
+    # pairing wins the three-way tie.
     result = align([note(0, "same")], [note(4000, "same")])
     assert [s["action"] for s in result["steps"]] == ["match"]
     assert result["total_cost"] == 4000
 
 
 def test_tie_left_gap_vs_right_gap_prefers_left_gap():
-    # Cell (1,2): left_gap and right_gap both cost 6000 (see derivation
-    # below); left_gap has the higher priority.
+    # At cell (1,2) the left-blank and right-blank routes both cost 6000;
+    # "left gap" wins per the tie-break order.
     left = [note(0, "a")]
     right = [note(4000, "a"), note(4100, "b")]
     result = align(left, right)
-    # (1,1): match 4000 ties with both gap routes -> match.
-    # (1,2): match = 2000 + 4100 + 3000 = 9100
-    #        left_gap  = dp(0,2)=4000 + 2000 = 6000
-    #        right_gap = dp(1,1)=4000 + 2000 = 6000  -> left_gap wins
+    # (1,1) is a triple tie at 4000 -> match; (1,2) is a gap tie at 6000
+    # -> left_gap (left blank, carrying right note 4100).
     assert result["total_cost"] == 6000
-    assert [s["action"] for s in result["steps"]] == [
-        "right_gap",
-        "right_gap",
-        "left_gap",
-    ]
+    assert [s["action"] for s in result["steps"]] == ["match", "left_gap"]
+    final = result["steps"][1]
+    assert final["left"] is None
+    assert final["right"] == note(4100, "b")
+
+
+def test_gap_action_name_matches_actually_blank_side():
+    # Invariant for every row: a left_gap row has no left note, and vice
+    # versa, regardless of which side the whole sequence lives on.
+    for lseq, rseq in [
+        ([note(1, "a"), note(2, "b")], []),
+        ([], [note(1, "a"), note(2, "b")]),
+        ([note(0, "a"), note(9000, "b")], [note(100, "b"), note(8999, "a")]),
+    ]:
+        result = align(lseq, rseq)
+        for step in result["steps"]:
+            if step["action"] == "left_gap":
+                assert step["left"] is None
+                assert step["right"] is not None
+            elif step["action"] == "right_gap":
+                assert step["right"] is None
+                assert step["left"] is not None
+            else:
+                assert step["left"] is not None and step["right"] is not None
 
 
 def test_chronological_order_and_cumulative_cost():
@@ -100,11 +128,12 @@ def test_steps_consume_each_note_once_without_crossing():
 
     matched_left = [s["left"]["time"] for s in result["steps"] if s["left"]]
     matched_right = [s["right"]["time"] for s in result["steps"] if s["right"]]
-    assert matched_left == sorted(left, key=lambda n: n["time"])[0:0] or True
     assert matched_left == [0, 10000]  # every left note appears, in order
     assert matched_right == [100, 9999]
-    assert result["counts"]["match"] + result["counts"]["left_gap"] == 2
+    # match + right_gap rows are exactly the rows that carry a left note;
+    # match + left_gap rows are exactly those carrying a right note.
     assert result["counts"]["match"] + result["counts"]["right_gap"] == 2
+    assert result["counts"]["match"] + result["counts"]["left_gap"] == 2
     assert sum(s["cost"] for s in result["steps"]) == result["total_cost"]
 
 

@@ -128,3 +128,47 @@ test("empty arrays are a valid zero-cost handoff", async ({ page }) => {
   await expect(page.getByTestId("timeline-row")).toHaveCount(0);
   await expect(page.getByTestId("total-cost")).toHaveText("0");
 });
+
+test("huge increasing timestamps (past safe-integer range) are not false duplicates", async ({
+  page,
+}) => {
+  // 2^53+1 and +3 collide when rounded to a JS double; the fill strings keep
+  // the exact digits verbatim (a numeric literal here would itself round).
+  await page.getByTestId("input-left").fill(
+    `[{"time":9007199254740993,"text":"交接点"},{"time":9007199254740995,"text":"结束语"}]`,
+  );
+  await page.getByTestId("input-right").fill(
+    `[{"time":9007199254740994,"text":"交接点"}]`,
+  );
+  await page.getByTestId("submit").click();
+
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  await expect(page.getByTestId("error-banner")).toHaveCount(0);
+  const rows = page.getByTestId("timeline-row");
+  await expect(rows).toHaveCount(2);
+  // Exact large digits are rendered, not double-rounded 9007199254740992.
+  await expect(rows.nth(0)).toContainText("9007199254740993 ms");
+  await expect(rows.nth(0)).toContainText("9007199254740994 ms");
+  // Same text, |1ms| difference -> single-step cost exactly 1.
+  await expect(page.getByTestId("step-cost").nth(0)).toHaveText("1");
+});
+
+test("only-left notes label the right side as blank and carry content on the left", async ({
+  page,
+}) => {
+  await page.getByTestId("input-left").fill(
+    JSON.stringify([{ time: 100, text: "仅左侧记录" }]),
+  );
+  await page.getByTestId("input-right").fill("[]");
+  await page.getByTestId("submit").click();
+
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  const row = page.getByTestId("timeline-row");
+  await expect(row).toHaveCount(1);
+  await expect(row).toHaveAttribute("data-action", "right_gap");
+  // Left cell shows the note, right cell shows the empty marker.
+  const cells = row.locator("td");
+  await expect(cells.nth(1)).toContainText("仅左侧记录");
+  await expect(cells.nth(3)).toContainText("∅");
+  await expect(page.getByTestId("step-cost")).toHaveText("2000");
+});

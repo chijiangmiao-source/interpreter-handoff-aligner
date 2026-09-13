@@ -97,6 +97,17 @@ def main() -> int:
         status == 200 and actions == ["match", "match", "right_gap", "left_gap"],
         f"actions={actions}",
     )
+    # Action name must equal the side that is actually blank on that row.
+    check(
+        "gap action name matches the blank side (row 2 right_gap keeps left note)",
+        body["steps"][2]["left"] == {"time": 9000, "text": "感谢各位的提问"}
+        and body["steps"][2]["right"] is None,
+    )
+    check(
+        "gap action name matches the blank side (row 3 left_gap keeps right note)",
+        body["steps"][3]["left"] is None
+        and body["steps"][3]["right"] == {"time": 12000, "text": "交接后的补充记录"},
+    )
     check("golden per-step costs", costs == [150, 100, 2000, 2000], f"costs={costs}")
     check("golden total cost 4250", body.get("total_cost") == 4250)
     cumulative = [s["cumulative_cost"] for s in body["steps"]]
@@ -128,15 +139,83 @@ def main() -> int:
     )
     check("different-text match costs |diff| + 3000", body["total_cost"] == 3000)
 
-    # 5c. Single-side gap costs exactly 2000
+    # 5c. Only a left note: the RIGHT side is blank on that row -> right_gap,
+    # costing exactly 2000 (action name = the side that is blank).
     status, body = http(
         "POST",
         f"{API_URL}/api/align",
         {"left": [{"time": 1, "text": "a"}], "right": []},
     )
     check(
-        "single-side gap costs 2000",
-        body["total_cost"] == 2000 and body["steps"][0]["action"] == "left_gap",
+        "left-only note -> right_gap (right side blank) costs 2000",
+        body["total_cost"] == 2000 and body["steps"][0]["action"] == "right_gap",
+        f"body={body}",
+    )
+    check(
+        "right_gap row carries the left note with right = null",
+        body["steps"][0]["left"] == {"time": 1, "text": "a"}
+        and body["steps"][0]["right"] is None,
+    )
+
+    # 5c-bis. Only a right note -> left_gap (left side blank).
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {"left": [], "right": [{"time": 1, "text": "a"}]},
+    )
+    check(
+        "right-only note -> left_gap (left side blank)",
+        body["steps"][0]["action"] == "left_gap"
+        and body["steps"][0]["left"] is None
+        and body["steps"][0]["right"] == {"time": 1, "text": "a"},
+        f"body={body}",
+    )
+
+    # 5c-ter. Timestamps beyond Number.MAX_SAFE_INTEGER must keep exact
+    # precision end to end: two adjacent increasing values that collide when
+    # rounded to a JS double must NOT be reported as duplicates, and the
+    # server-computed cost must reflect the exact 1ms difference.
+    big_a = 9007199254740993  # 2^53+1
+    big_b = 9007199254740995  # 2^53+3; JSON.parse rounds both together
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            "left": [
+                {"time": big_a, "text": "交接点"},
+                {"time": big_b, "text": "结束语"},
+            ],
+            "right": [{"time": big_a + 1, "text": "交接点"}],
+        },
+    )
+    check(
+        "huge increasing integers are not false duplicates (200 ok)",
+        status == 200 and body.get("total_cost") is not None,
+        f"status={status} body={body}",
+    )
+    check(
+        "huge integer digits survive response exactly (|Δt| = 1)",
+        body["steps"][0]["left"]["time"] == big_a
+        and body["steps"][0]["right"]["time"] == big_a + 1
+        and body["steps"][0]["cost"] == 1,
+        f"step0={body.get('steps', [None])[0]}",
+    )
+    # A genuine duplicate at huge magnitude must still fail exactly once.
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            "left": [
+                {"time": big_a, "text": "a"},
+                {"time": big_a, "text": "b"},
+            ],
+            "right": [],
+        },
+    )
+    check(
+        "genuine duplicate huge integer still fails once at left[1].time",
+        status == 422 and body.get("path") == "left[1].time",
+        f"status={status} body={body}",
     )
 
     # 5d. Two gaps preferred to a 9000-time-difference match; tie at 4000

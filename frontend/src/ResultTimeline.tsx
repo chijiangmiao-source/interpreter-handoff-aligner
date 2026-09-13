@@ -1,4 +1,4 @@
-import type { AlignResponse, AlignStep } from "./types";
+import type { AlignResponse, AlignStep, Int } from "./types";
 
 const ACTION_LABEL: Record<AlignStep["action"], string> = {
   match: "配对",
@@ -6,8 +6,21 @@ const ACTION_LABEL: Record<AlignStep["action"], string> = {
   right_gap: "右侧留空",
 };
 
-function fmtTime(t: number | null): string {
-  return t === null ? "—" : `${t} ms`;
+function n(v: Int): string {
+  return typeof v === "bigint" ? v.toString() : String(v);
+}
+
+function absDiff(a: Int, b: Int): string {
+  if (typeof a === "bigint" || typeof b === "bigint") {
+    const x = BigInt(a);
+    const y = BigInt(b);
+    return n(x > y ? x - y : y - x);
+  }
+  return String(Math.abs(a - b));
+}
+
+function fmtTime(t: Int | null | undefined): string {
+  return t === null || t === undefined ? "—" : `${n(t)} ms`;
 }
 
 /** Human-readable recomputation of the single-step cost, row by row. */
@@ -17,12 +30,12 @@ function costExplanation(step: AlignStep): string {
   }
   const lt = step.left!.time;
   const rt = step.right!.time;
+  const diff = absDiff(lt, rt);
   const same = step.left!.text === step.right!.text;
-  const diff = Math.abs(lt - rt);
   if (same) {
-    return `相同文本：|${lt} − ${rt}| = ${diff}`;
+    return `相同文本：|${n(lt)} − ${n(rt)}| = ${diff}`;
   }
-  return `不同文本：|${lt} − ${rt}| + 3000 = ${diff} + 3000 = ${diff + 3000}`;
+  return `不同文本：|${n(lt)} − ${n(rt)}| + 3000 = ${diff} + 3000 = ${n(step.cost)}`;
 }
 
 export default function ResultTimeline({
@@ -30,8 +43,16 @@ export default function ResultTimeline({
   runningTotal,
 }: {
   result: AlignResponse;
-  runningTotal?: number;
+  runningTotal?: Int;
 }) {
+  const shownTotal: Int = runningTotal ?? result.total_cost;
+  const sumOfStepCosts = result.steps.reduce<Int>(
+    (acc, s) => (typeof acc === "bigint" || typeof s.cost === "bigint"
+      ? BigInt(acc) + BigInt(s.cost)
+      : acc + (s.cost as number)),
+    0,
+  );
+
   return (
     <section className="result" data-testid="result-panel">
       <h2>唯一最优时间轴</h2>
@@ -44,12 +65,13 @@ export default function ResultTimeline({
         <span className="badge left-gap">左侧留空 {result.counts.left_gap}</span>
         <span className="badge right-gap">右侧留空 {result.counts.right_gap}</span>
         <span className="badge total">
-          {runningTotal !== undefined && runningTotal !== result.total_cost
+          {runningTotal !== undefined &&
+          n(runningTotal) !== n(result.total_cost)
             ? "复算累计 "
             : "总代价 "}
-          <strong data-testid="total-cost">{runningTotal ?? result.total_cost}</strong>
-          {runningTotal !== undefined && runningTotal !== result.total_cost
-            ? `（最终 ${result.total_cost}）`
+          <strong data-testid="total-cost">{n(shownTotal)}</strong>
+          {runningTotal !== undefined && n(runningTotal) !== n(result.total_cost)
+            ? `（最终 ${n(result.total_cost)}）`
             : ""}
         </span>
       </div>
@@ -102,10 +124,10 @@ export default function ResultTimeline({
                   )}
                 </td>
                 <td className="cost" data-testid="step-cost">
-                  {step.cost}
+                  {n(step.cost)}
                 </td>
                 <td className="cumulative" data-testid="step-cumulative">
-                  {step.cumulative_cost}
+                  {n(step.cumulative_cost)}
                 </td>
                 <td className="explain">{costExplanation(step)}</td>
               </tr>
@@ -116,11 +138,9 @@ export default function ResultTimeline({
               <td colSpan={4} className="total-label">
                 总成本最小
               </td>
-              <td className="total-step">
-                {result.steps.reduce((s, x) => s + x.cost, 0)}
-              </td>
+              <td className="total-step">{n(sumOfStepCosts)}</td>
               <td className="total-final" data-testid="total-cost-foot">
-                {result.total_cost}
+                {n(result.total_cost)}
               </td>
               <td />
             </tr>

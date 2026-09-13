@@ -26,6 +26,13 @@
 **一次**明确失败，响应（与页面高亮）指向首个错误路径，如 `left[2].time`，
 且原始输入原样保留。
 
+> **超大毫秒整数**：`time` 按任意精度整数处理。前端手写的 JSON 解析器把
+> 整数数字字面量保留为 `BigInt`，并将两个文本框里的数组**原始文本**直接
+> 发给后端（不经过 `JSON.parse`/`JSON.stringify` 重序列化），后端 Python
+> 原生支持任意精度整数。因此即使相邻时间超过 `Number.MAX_SAFE_INTEGER`
+> （2⁵³−1，例如 `9007199254740993` 与 `9007199254740995`），也不会因
+> double 舍入而被误报为重复；真正相等的超大整数仍会被准确拦截。
+
 ### 输入示例
 
 ```json
@@ -52,10 +59,10 @@
      "right": {"time": 150, "text": "各位媒体朋友下午好"}, "cost": 150, "cumulative_cost": 150},
     {"action": "match", "left": {"time": 4200, "text": "新产品将于下月上市"},
      "right": {"time": 4100, "text": "新产品将于下月上市"}, "cost": 100, "cumulative_cost": 250},
-    {"action": "right_gap", "left": null,
-     "right": {"time": 12000, "text": "交接后的补充记录"}, "cost": 2000, "cumulative_cost": 2250},
-    {"action": "left_gap", "left": {"time": 9000, "text": "感谢各位的提问"},
-     "right": null, "cost": 2000, "cumulative_cost": 4250}
+    {"action": "right_gap", "left": {"time": 9000, "text": "感谢各位的提问"},
+     "right": null, "cost": 2000, "cumulative_cost": 2250},
+    {"action": "left_gap", "left": null,
+     "right": {"time": 12000, "text": "交接后的补充记录"}, "cost": 2000, "cumulative_cost": 4250}
   ],
   "total_cost": 4250,
   "counts": {"match": 2, "left_gap": 1, "right_gap": 1},
@@ -63,11 +70,14 @@
 }
 ```
 
-三种动作：
+三种动作（动作名表示**该行哪一侧留空**，非空的另一侧携带该条笔记）：
 
 - `match`：左右各一项配对；
-- `left_gap`：左侧有记录、右侧留空（右侧漏记）；
-- `right_gap`：右侧有记录、左侧留空（左侧漏记）。
+- `left_gap`：**左侧留空**，行内只有右侧记录（左侧漏记）；
+- `right_gap`：**右侧留空**，行内只有左侧记录（右侧漏记）。
+
+因此整组笔记只在一侧时，每一行都会正确地标出实际留空的另一侧：
+只有 `left` 输入时动作为 `right_gap`，只有 `right` 输入时为 `left_gap`。
 
 ---
 
@@ -151,7 +161,7 @@ npm run dev        # http://localhost:5173 ，/api 自动代理到 127.0.0.1:800
 
 ## 5. 测试
 
-### pytest — 算法、校验与 API（40 个用例）
+### pytest — 算法、校验与 API（41 个用例）
 
 ```bash
 cd backend
@@ -161,7 +171,7 @@ python -m pytest
 其中包含对所有小规模输入与朴素递归枚举的最优代价对拍，以及平局偏好
 （配对 > 左留空 > 右留空）的专门用例。
 
-### Vitest — 前端逻辑与组件（27 个用例）
+### Vitest — 前端逻辑与组件（37 个用例）
 
 ```bash
 cd frontend
@@ -171,7 +181,7 @@ npm test
 覆盖与后端一致的客户端校验、带源码位置的 JSON 解析器、API 客户端、
 错误路径高亮、输入保留与逐步复算交互。
 
-### Playwright — 真实全栈联调（6 个用例）
+### Playwright — 真实全栈联调（8 个用例）
 
 先启动真实服务（生产构建 + FastAPI）：
 

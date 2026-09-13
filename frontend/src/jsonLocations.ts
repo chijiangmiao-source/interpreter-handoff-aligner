@@ -189,8 +189,9 @@ export function parseLocated(src: string): LocatedJson {
     throw new JsonSourceError("字符串没有结束引号。", i);
   };
 
-  const readNumber = (): number => {
+  const readNumber = (): number | bigint => {
     const start = i;
+    let isFloat = false;
     if (src[i] === "-") i++;
     if (src[i] === "0") {
       i++;
@@ -200,6 +201,7 @@ export function parseLocated(src: string): LocatedJson {
       throw new JsonSourceError("非法数字。", i);
     }
     if (src[i] === ".") {
+      isFloat = true;
       i++;
       if (!(src[i] >= "0" && src[i] <= "9")) {
         throw new JsonSourceError("小数点后至少需要一位数字。", i);
@@ -207,6 +209,7 @@ export function parseLocated(src: string): LocatedJson {
       while (src[i] >= "0" && src[i] <= "9") i++;
     }
     if (src[i] === "e" || src[i] === "E") {
+      isFloat = true;
       i++;
       if (src[i] === "+" || src[i] === "-") i++;
       if (!(src[i] >= "0" && src[i] <= "9")) {
@@ -214,7 +217,11 @@ export function parseLocated(src: string): LocatedJson {
       }
       while (src[i] >= "0" && src[i] <= "9") i++;
     }
-    return Number(src.slice(start, i));
+    const literal = src.slice(start, i);
+    // Keep integer literals (timestamps may be far beyond Number.MAX_SAFE
+    // INTEGER — millisecond times in far-future/epoch variants) as BigInt
+    // with their exact digits; only floats become JS numbers.
+    return isFloat ? Number(literal) : BigInt(literal);
   };
 
   ws();

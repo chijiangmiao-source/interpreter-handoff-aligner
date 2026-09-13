@@ -2,18 +2,44 @@ import { describe, expect, it } from "vitest";
 import { locateOffset, parseLocated, JsonSourceError } from "./jsonLocations";
 
 describe("parseLocated", () => {
-  it("parses all JSON value types and matches JSON.parse", () => {
-    const samples = [
-      `[]`,
-      `{}`,
+  it("parses all JSON value types", () => {
+    // Integer literals are kept as exact bigints; floats/exponents as number.
+    const { value } = parseLocated(
       `[1, 2.5, -3, 1e2, true, false, null, "s\\n\\"\\\\"]`,
-      `{"a": {"b": [10, {"c": 20}]}}`,
-      `  [ 1 , { "k" : "v" } ]  `,
-    ];
-    for (const s of samples) {
-      const { value } = parseLocated(s);
-      expect(value).toEqual(JSON.parse(s));
-    }
+    );
+    expect(value).toEqual([
+      1n,
+      2.5,
+      -3n,
+      100,
+      true,
+      false,
+      null,
+      's\n"\\',
+    ]);
+  });
+
+  it("preserves integer digits far beyond Number.MAX_SAFE_INTEGER", () => {
+    const { value } = parseLocated(
+      `[{"time": 9007199254740993, "text": "a"}, {"time": 9007199254740995, "text": "b"}]`,
+    );
+    const arr = value as Array<{ time: bigint }>;
+    expect(arr[0].time).toBe(9007199254740993n);
+    expect(arr[1].time).toBe(9007199254740995n);
+    // The two values must NOT collapse to the same double the way JSON.parse does.
+    expect(arr[0].time === arr[1].time).toBe(false);
+    // Demonstrating the precision loss our parser avoids: JSON.parse rounds
+    // 9007199254740993 down to the nearest double.
+    expect(JSON.parse(`9007199254740993`)).toBe(9007199254740992);
+  });
+
+  it("parses nested structures like JSON.parse (modulo integer bigints)", () => {
+    const { value } = parseLocated(`{"a": {"b": [10, {"c": 20}]}}`);
+    expect(value).toEqual({ a: { b: [10n, { c: 20n }] } });
+  });
+
+  it("trims surrounding whitespace", () => {
+    expect(parseLocated(`  []  `).value).toEqual([]);
   });
 
   it("records array element ranges", () => {
