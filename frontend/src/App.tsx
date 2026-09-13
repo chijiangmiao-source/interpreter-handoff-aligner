@@ -1,9 +1,9 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import AnchorPanel, { type PickerNote } from "./AnchorPanel";
 import HighlightedTextarea from "./HighlightedTextarea";
 import ResultTimeline from "./ResultTimeline";
 import { alignNotes, rootRawText, AlignRequestError } from "./api";
-import { validateAnchors } from "./anchors";
+import { validateAnchors, type AnchorIssue } from "./anchors";
 import {
   JsonSourceError,
   locateOffset,
@@ -59,11 +59,19 @@ export default function App() {
   const [leftText, setLeftText] = useState(SAMPLE_LEFT);
   const [rightText, setRightText] = useState(SAMPLE_RIGHT);
   const [anchors, setAnchors] = useState<Anchor[]>([]);
-  const [pickError, setPickError] = useState<string | null>(null);
+  // Half-made pair selection lives here (not in the panel) so loading the
+  // sample or clearing the inputs always starts from no pending pick.
+  const [selLeft, setSelLeft] = useState<number | null>(null);
+  const [selRight, setSelRight] = useState<number | null>(null);
   const [error, setError] = useState<MarkedError | null>(null);
   const [result, setResult] = useState<AlignResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [revealed, setRevealed] = useState(0);
+  // Bumped by every input/anchor mutation. A submission captures the current
+  // generation and only applies its response while no mutation has happened
+  // since, so a late response never resurrects a timeline computed from
+  // inputs the user has already changed.
+  const submitSeq = useRef(0);
 
   const located = useMemo(() => {
     const parse = (text: string) => {
@@ -109,37 +117,96 @@ export default function App() {
     return rangeForRelative(side, error.path.slice(prefix.length));
   }
 
-  function addAnchor(candidate: Anchor): string | null {
-    const tentative = [...anchors, candidate];
-    // Local, single-failure check mirrors the server (range, reuse, order).
-    const issue = validateAnchors(
-      tentative,
-      leftNotes.length,
-      rightNotes.length,
-    );
+  /**
+   * Surface the first anchor rule violation (if any) exactly like a server
+   * 422 would: one banner plus the offending anchor row flagged in place.
+   */
+  function applyAnchorIssue(issue: AnchorIssue | null) {
     if (issue) {
-      setPickError(issue.message);
-      return issue.message;
+      setError({
+        message: issue.message,
+        path: issue.path,
+        side: null,
+        anchorIndex: issue.index >= 0 ? issue.index : undefined,
+      });
+    } else {
+      setError(null);
     }
+  }
+
+  /**
+   * Pin a pair. The candidate is always kept in the list; when it breaks a
+   * rule (at pick time the only reachable case is a crossing pair) the first
+   * offending anchor is flagged instead of silently dropping one side's mark.
+   */
+  function addAnchor(candidate: Anchor) {
+    submitSeq.current += 1;
+    const tentative = [...anchors, candidate];
     setAnchors(tentative);
-    setPickError(null);
-    setError(null);
+    applyAnchorIssue(
+      validateAnchors(tentative, leftNotes.length, rightNotes.length),
+    );
     setResult(null);
-    return null;
   }
 
   function removeAnchor(index: number) {
-    setAnchors((prev) => prev.filter((_, k) => k !== index));
-    setPickError(null);
-    setError(null);
+    submitSeq.current += 1;
+    const remaining = anchors.filter((_, k) => k !== index);
+    setAnchors(remaining);
+    // Re-flag the first remaining violation, if any; otherwise clear it.
+    applyAnchorIssue(
+      validateAnchors(remaining, leftNotes.length, rightNotes.length),
+    );
     setResult(null);
+  }
+
+  /** Anchor-picker click: complete a pair, toggle a pending pick, or unpin. */
+  function handlePick(side: Side, idx: number) {
+    // Clicking a record already pinned to an anchor unpins that whole anchor.
+    const existing = anchors.findIndex((a) => a[side] === idx);
+    if (existing >= 0) {
+      removeAnchor(existing);
+      setSelLeft(null);
+      setSelRight(null);
+      return;
+    }
+
+    if (side === "left") {
+      if (selLeft === idx) {
+        setSelLeft(null);
+        return;
+      }
+      if (selRight !== null) {
+        addAnchor({ left: idx, right: selRight });
+        setSelLeft(null);
+        setSelRight(null);
+        return;
+      }
+      setSelLeft(idx);
+    } else {
+      if (selRight === idx) {
+        setSelRight(null);
+        return;
+      }
+      if (selLeft !== null) {
+        addAnchor({ left: selLeft, right: idx });
+        setSelLeft(null);
+        setSelRight(null);
+        return;
+      }
+      setSelRight(idx);
+    }
   }
 
   async function handleSubmit() {
     setError(null);
     setResult(null);
-    setPickError(null);
     setLoading(true);
+    // Generation this submission belongs to. Any edit to the inputs or the
+    // anchors before the response returns bumps the counter, marking this
+    // in-flight request stale: its late response must not be displayed.
+    const generation = ++submitSeq.current;
+    const isCurrent = () => generation === submitSeq.current;
     try {
       // --- Phase 1: each textarea must itself parse as JSON (left first) ---
       let leftParsed: ReturnType<typeof parseLocated>;
@@ -203,9 +270,15 @@ export default function App() {
       const anchorsToSend = anchors.length > 0 ? anchors : undefined;
       try {
         const aligned = await alignNotes(leftRaw, rightRaw, fetch, anchorsToSend);
+        // The user edited the notes or anchors while the request was in
+        // flight: this timeline was computed from superseded input, so it
+        // must not reappear under the current input.
+        if (!isCurrent()) return;
         setResult(aligned);
         setRevealed(aligned.steps.length);
       } catch (e) {
+        // A stale failure refers to input that is no longer on screen.
+        if (!isCurrent()) return;
         if (e instanceof AlignRequestError && e.path) {
           const anchorIndex = anchorIndexFromPath(e.path);
           if (anchorIndex >= 0 || e.path === "anchors") {
@@ -249,20 +322,24 @@ export default function App() {
   }
 
   function loadSample() {
+    submitSeq.current += 1;
     setLeftText(SAMPLE_LEFT);
     setRightText(SAMPLE_RIGHT);
     setAnchors([]);
-    setPickError(null);
+    setSelLeft(null);
+    setSelRight(null);
     setError(null);
     setResult(null);
     setRevealed(0);
   }
 
   function clearAll() {
+    submitSeq.current += 1;
     setLeftText("[]");
     setRightText("[]");
     setAnchors([]);
-    setPickError(null);
+    setSelLeft(null);
+    setSelRight(null);
     setError(null);
     setResult(null);
     setRevealed(0);
@@ -297,6 +374,7 @@ export default function App() {
         <HighlightedTextarea
           value={leftText}
           onChange={(v) => {
+            submitSeq.current += 1;
             setLeftText(v);
             setError(null);
             setResult(null);
@@ -309,6 +387,7 @@ export default function App() {
         <HighlightedTextarea
           value={rightText}
           onChange={(v) => {
+            submitSeq.current += 1;
             setRightText(v);
             setError(null);
             setResult(null);
@@ -325,8 +404,9 @@ export default function App() {
         rightNotes={rightNotes}
         anchors={anchors}
         errorIndex={flaggedAnchorIndex}
-        pickError={pickError}
-        onAdd={addAnchor}
+        selLeft={selLeft}
+        selRight={selRight}
+        onPick={handlePick}
         onRemove={removeAnchor}
       />
 

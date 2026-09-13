@@ -131,6 +131,16 @@ export default function ResultTimeline({
                     {ACTION_LABEL[step.action]}
                   </span>
                 </td>
+                <td className="note-cell">
+                  {step.right ? (
+                    <>
+                      <span className="time">{fmtTime(step.right.time)}</span>
+                      <span className="text">{step.right.text}</span>
+                    </>
+                  ) : (
+                    <span className="empty">∅</span>
+                  )}
+                </td>
                 <td className="origin-cell">
                   {step.origin ? (
                     <span
@@ -141,16 +151,6 @@ export default function ResultTimeline({
                     </span>
                   ) : (
                     <span className="origin-tag origin-none">—</span>
-                  )}
-                </td>
-                <td className="note-cell">
-                  {step.right ? (
-                    <>
-                      <span className="time">{fmtTime(step.right.time)}</span>
-                      <span className="text">{step.right.text}</span>
-                    </>
-                  ) : (
-                    <span className="empty">∅</span>
                   )}
                 </td>
                 <td className="cost" data-testid="step-cost">

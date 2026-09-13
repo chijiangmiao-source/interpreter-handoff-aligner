@@ -167,10 +167,10 @@ test("only-left notes label the right side as blank and carry content on the lef
   await expect(row).toHaveCount(1);
   await expect(row).toHaveAttribute("data-action", "right_gap");
   // Left cell shows the note, right cell shows the empty marker.
-  // Columns: # | left | action | source(origin) | right | cost | cumulative | explain
+  // Columns: # | left | action | right | source | cost | cumulative | explain
   const cells = row.locator("td");
   await expect(cells.nth(1)).toContainText("仅左侧记录");
-  await expect(cells.nth(4)).toContainText("∅");
+  await expect(cells.nth(3)).toContainText("∅");
   await expect(page.getByTestId("step-cost")).toHaveText("2000");
 });
 
@@ -224,9 +224,10 @@ test("forcing a non-obvious anchor changes the alignment and pins the pair", asy
 test("crossing anchors fail once, keep inputs and markers, show no timeline", async ({
   page,
 }) => {
-  // The local picker refuses to add a crossing pair, so a cross can only reach
-  // the server from a stale/raced selection. Simulate that single 422 to
-  // assert the page's failure UX (real cross is covered by the live-API test).
+  // The local picker keeps a crossing pair and flags it before submit, so a
+  // cross can only reach the server from a stale/raced selection. Simulate
+  // that single 422 to assert the page's failure UX (a real cross is covered
+  // by the live-API test below).
   await page.route("**/api/align", async (route) => {
     await route.fulfill({
       status: 422,

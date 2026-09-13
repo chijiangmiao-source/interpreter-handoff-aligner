@@ -313,7 +313,7 @@ describe("App", () => {
     expect(screen.getByTestId("pick-right-1")).toHaveAttribute("data-used", "true");
   });
 
-  it("rejects a crossing pair locally without adding it", () => {
+  it("keeps a crossing pair and flags the first offending anchor", () => {
     render(<App />);
     // First valid anchor (1, 1).
     fireEvent.click(screen.getByTestId("pick-left-1"));
@@ -322,10 +322,154 @@ describe("App", () => {
     fireEvent.click(screen.getByTestId("pick-left-2"));
     fireEvent.click(screen.getByTestId("pick-right-0"));
 
-    expect(screen.getByTestId("anchor-pick-error")).toBeInTheDocument();
-    // Only the first anchor remains; right[0] is not consumed.
+    // The crossing candidate is kept as a listed anchor, not dropped.
+    const items = screen.getAllByTestId("anchor-item");
+    expect(items).toHaveLength(2);
+    expect(items[1]).toHaveTextContent("left[2]");
+    expect(items[1]).toHaveTextContent("right[0]");
+    // Both crossed records stay marked as pinned.
+    expect(screen.getByTestId("pick-left-2")).toHaveAttribute("data-used", "true");
+    expect(screen.getByTestId("pick-right-0")).toHaveAttribute("data-used", "true");
+    // The first offending anchor is flagged beside its row and in the banner.
+    expect(items[1]).toHaveClass("invalid");
+    expect(items[0]).not.toHaveClass("invalid");
+    expect(screen.getByTestId("anchor-error")).toBeInTheDocument();
+    expect(screen.getByTestId("error-banner")).toBeInTheDocument();
+    expect(screen.getByTestId("error-path").textContent).toContain("anchors[1].right");
+    // No possibly-valid timeline appears.
+    expect(screen.queryByTestId("result-panel")).toBeNull();
+  });
+
+  it("unflagging a crossing pair (via unpin) clears the error", () => {
+    render(<App />);
+    fireEvent.click(screen.getByTestId("pick-left-1"));
+    fireEvent.click(screen.getByTestId("pick-right-1"));
+    fireEvent.click(screen.getByTestId("pick-left-2"));
+    fireEvent.click(screen.getByTestId("pick-right-0"));
+    expect(screen.getByTestId("error-banner")).toBeInTheDocument();
+
+    // Clicking a pinned record of the offending pair unpins the whole anchor.
+    fireEvent.click(screen.getByTestId("pick-right-0"));
     expect(screen.getAllByTestId("anchor-item")).toHaveLength(1);
-    expect(screen.getByTestId("pick-right-0")).toHaveAttribute("data-used", "false");
+    expect(screen.queryByTestId("error-banner")).toBeNull();
+    expect(screen.queryByTestId("anchor-error")).toBeNull();
+  });
+
+  it("resets a half-made selection when clearing and reloading the sample", () => {
+    render(<App />);
+    // Pick only a left record, then clear and reload the sample.
+    fireEvent.click(screen.getByTestId("pick-left-0"));
+    expect(screen.getByTestId("pick-left-0")).toHaveAttribute("data-selected", "true");
+    fireEvent.click(screen.getByTestId("clear"));
+    fireEvent.click(screen.getByTestId("sample"));
+
+    // No pending selection survives: nothing is marked selected...
+    expect(screen.getByTestId("pick-left-0")).toHaveAttribute("data-selected", "false");
+    // ...and the next single pick starts a fresh pair instead of completing
+    // one with the stale left record.
+    fireEvent.click(screen.getByTestId("pick-right-1"));
+    expect(screen.queryAllByTestId("anchor-item")).toHaveLength(0);
+    expect(screen.getByTestId("pick-right-1")).toHaveAttribute("data-selected", "true");
+  });
+
+  it("places each timeline cell under its own header", async () => {
+    vi.stubGlobal("fetch", mockFetchOnce(anchoredBody));
+    render(<App />);
+    fireEvent.click(screen.getByTestId("pick-left-0"));
+    fireEvent.click(screen.getByTestId("pick-right-0"));
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    const headers = screen
+      .getAllByRole("columnheader")
+      .map((h) => h.textContent);
+    expect(headers).toEqual([
+      "#",
+      "左侧口译员",
+      "动作",
+      "右侧口译员",
+      "来源",
+      "单步代价",
+      "累计代价",
+      "复算",
+    ]);
+    // First (anchor) row: the right note sits under 右侧口译员 and the
+    // source tag under 来源 — not the other way around.
+    const cells = screen
+      .getAllByTestId("timeline-row")[0]
+      .querySelectorAll("td");
+    expect(cells[1]).toHaveTextContent("0 ms");
+    expect(cells[3]).toHaveTextContent("150 ms");
+    expect(cells[3]).toHaveTextContent("各位媒体朋友下午好");
+    expect(cells[4]).toHaveTextContent("人工锚点");
+    vi.unstubAllGlobals();
+  });
+
+  it("does not show a response that returns after the input changed", async () => {
+    let resolveFetch: (r: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFetch = resolve;
+          }),
+      ) as unknown as typeof fetch,
+    );
+    render(<App />);
+    fireEvent.click(screen.getByTestId("submit"));
+
+    // The notes change while the request is still in flight.
+    fireEvent.change(screen.getByTestId("input-left"), {
+      target: { value: "[]" },
+    });
+    // The stale response (computed from the pre-edit notes) arrives late.
+    resolveFetch(
+      new Response(JSON.stringify(okBody), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("submit")).not.toBeDisabled(),
+    );
+    // The out-of-date timeline is not shown under the new input.
+    expect(screen.queryByTestId("result-panel")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  it("does not show a stale 422 after the input changed mid-flight", async () => {
+    let resolveFetch: (r: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFetch = resolve;
+          }),
+      ) as unknown as typeof fetch,
+    );
+    render(<App />);
+    fireEvent.click(screen.getByTestId("submit"));
+    fireEvent.change(screen.getByTestId("input-left"), {
+      target: { value: "[]" },
+    });
+    resolveFetch(
+      new Response(
+        JSON.stringify({ error: "未严格递增", path: "left[1].time" }),
+        { status: 422, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("submit")).not.toBeDisabled(),
+    );
+    expect(screen.queryByTestId("error-banner")).toBeNull();
+    expect(screen.queryByTestId("result-panel")).toBeNull();
+    vi.unstubAllGlobals();
   });
 
   it("sends anchors on submit, then shows anchor vs auto origins", async () => {

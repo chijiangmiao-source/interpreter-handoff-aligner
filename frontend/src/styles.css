@@ -332,12 +332,6 @@ button.primary:hover:not(:disabled) {
   font-weight: 700;
 }
 
-.anchor-pick-error {
-  color: var(--danger);
-  font-size: 13px;
-  margin: 10px 0 0;
-}
-
 /* ---- Result row provenance --------------------------------------------- */
 
 .origin-cell {

@@ -1,4 +1,3 @@
-import { useState } from "react";
 import type { Anchor } from "./types";
 
 /** A parsed record as presented for anchor picking (may be malformed). */
@@ -14,9 +13,10 @@ interface Props {
   anchors: Anchor[];
   /** Index of the anchor the server/client flagged, -1 when none. */
   errorIndex: number;
-  /** Inline validation message for a pair the user just tried to add. */
-  pickError: string | null;
-  onAdd: (anchor: Anchor) => string | null;
+  /** Half-made pair selection, owned by the parent so it can be reset. */
+  selLeft: number | null;
+  selRight: number | null;
+  onPick: (side: "left" | "right", idx: number) => void;
   onRemove: (index: number) => void;
 }
 
@@ -34,62 +34,24 @@ function asText(v: unknown): string {
  * left record and one right record to pin a pair; click a pinned record again
  * to unpin it. Anchors are the only rows that can later be styled as
  * human-confirmed in the result timeline; everything else stays DP-generated.
+ *
+ * The component is purely presentational: the pending selection and the
+ * pairing rules live in the parent, so resetting the inputs always resets
+ * the picker too, and a rule-violating pair stays listed and flagged instead
+ * of vanishing from one side.
  */
 export default function AnchorPanel({
   leftNotes,
   rightNotes,
   anchors,
   errorIndex,
-  pickError,
-  onAdd,
+  selLeft,
+  selRight,
+  onPick,
   onRemove,
 }: Props) {
-  const [selLeft, setSelLeft] = useState<number | null>(null);
-  const [selRight, setSelRight] = useState<number | null>(null);
-
   const anchorUsing = (side: "left" | "right", idx: number): number =>
     anchors.findIndex((a) => a[side] === idx);
-
-  function clearSelection() {
-    setSelLeft(null);
-    setSelRight(null);
-  }
-
-  function handleClick(side: "left" | "right", idx: number) {
-    // Clicking a record already pinned to an anchor unpins that whole anchor.
-    const existing = anchorUsing(side, idx);
-    if (existing >= 0) {
-      onRemove(existing);
-      clearSelection();
-      return;
-    }
-
-    if (side === "left") {
-      if (selLeft === idx) {
-        setSelLeft(null);
-        return;
-      }
-      if (selRight !== null) {
-        const message = onAdd({ left: idx, right: selRight });
-        if (!message) clearSelection();
-        else setSelLeft(null);
-        return;
-      }
-      setSelLeft(idx);
-    } else {
-      if (selRight === idx) {
-        setSelRight(null);
-        return;
-      }
-      if (selLeft !== null) {
-        const message = onAdd({ left: selLeft, right: idx });
-        if (!message) clearSelection();
-        else setSelRight(null);
-        return;
-      }
-      setSelRight(idx);
-    }
-  }
 
   const renderColumn = (
     side: "left" | "right",
@@ -119,7 +81,7 @@ export default function AnchorPanel({
                 data-testid={`pick-${side}-${note.index}`}
                 data-used={used >= 0}
                 data-selected={isSel}
-                onClick={() => handleClick(side, note.index)}
+                onClick={() => onPick(side, note.index)}
               >
                 <span className="pick-idx">{side}[{note.index}]</span>
                 <span className="pick-time">{asTime(note.time)} ms</span>
@@ -144,12 +106,6 @@ export default function AnchorPanel({
         {renderColumn("left", leftNotes, selLeft, "picker-left")}
         {renderColumn("right", rightNotes, selRight, "picker-right")}
       </div>
-
-      {pickError && (
-        <p className="anchor-pick-error" data-testid="anchor-pick-error">
-          {pickError}
-        </p>
-      )}
 
       <h3>已确认锚点（{anchors.length}）</h3>
       {anchors.length === 0 ? (
