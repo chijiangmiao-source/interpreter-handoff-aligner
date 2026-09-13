@@ -57,6 +57,165 @@ def get(url: str) -> tuple[int, str]:
         return resp.status, resp.read().decode()
 
 
+GAP = 2000
+MISMATCH = 3000
+
+
+def _pair_cost(a: dict, b: dict) -> int:
+    return abs(a["time"] - b["time"]) + (0 if a["text"] == b["text"] else MISMATCH)
+
+
+def _free_segment_cost(li: list, ri: list) -> int:
+    """Independent optimum for two sub-sequences (plain stdlib DP)."""
+    m, n = len(li), len(ri)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        dp[i][0] = dp[i - 1][0] + GAP
+    for j in range(1, n + 1):
+        dp[0][j] = dp[0][j - 1] + GAP
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            dp[i][j] = min(
+                dp[i - 1][j - 1] + _pair_cost(li[i - 1], ri[j - 1]),
+                dp[i][j - 1] + GAP,
+                dp[i - 1][j] + GAP,
+            )
+    return dp[m][n]
+
+
+def expected_anchored_cost(left, right, anchors) -> int:
+    """Constrained optimum: per-interval optimum plus each anchor's cost."""
+    bounds = [(-1, -1), *anchors, (len(left), len(right))]
+    total = 0
+    for (a0, b0), (a1, b1) in zip(bounds, bounds[1:]):
+        total += _free_segment_cost(left[a0 + 1 : a1], right[b0 + 1 : b1])
+        if a1 < len(left):  # a real forced anchor (not the trailing bound)
+            total += _pair_cost(left[a1], right[b1])
+    return total
+
+
+def run_anchor_checks(left, right, free_body) -> None:
+    """Acceptance for the four anchor guarantees."""
+    base = {"left": left, "right": right}
+
+    # Guarantee 1: a request WITHOUT anchors is byte-shape identical and never
+    # carries anchors/provenance.
+    status, body = http("POST", f"{API_URL}/api/align", base)
+    check(
+        "anchors: absent-anchor request keeps the exact free result",
+        status == 200 and body == free_body,
+        f"body={body}",
+    )
+    check(
+        "anchors: free response has no anchors field and no per-row origin",
+        "anchors" not in body
+        and all("origin" not in s for s in body["steps"]),
+    )
+    # An explicitly empty anchors array is the same legacy request.
+    status, body_empty = http(
+        "POST", f"{API_URL}/api/align", {**base, "anchors": []}
+    )
+    check(
+        "anchors: empty anchors array equals the legacy result",
+        status == 200 and body_empty == free_body,
+    )
+
+    # Guarantee 2: legal anchors are fixed into the timeline and each interval
+    # is independently optimal.
+    anchors = [[0, 0], [2, 1]]
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {**base, "anchors": [{"left": a, "right": b} for a, b in anchors]},
+    )
+    anchor_rows = [s for s in body["steps"] if s.get("origin") == "anchor"]
+    auto_rows = [s for s in body["steps"] if s.get("origin") == "auto"]
+    check(
+        "anchors: legal anchors fixed into the rows as matches",
+        status == 200
+        and body.get("anchors") == [{"left": 0, "right": 0}, {"left": 2, "right": 1}]
+        and len(anchor_rows) == 2
+        and all(s["action"] == "match" for s in anchor_rows)
+        and anchor_rows[0]["left"] == left[0]
+        and anchor_rows[0]["right"] == right[0]
+        and anchor_rows[1]["left"] == left[2]
+        and anchor_rows[1]["right"] == right[1],
+        f"body={body}",
+    )
+    check(
+        "anchors: human rows vs generated rows are clearly distinguished",
+        len(auto_rows) == len(body["steps"]) - 2
+        and all(s.get("origin") == "auto" for s in auto_rows),
+    )
+    check(
+        "anchors: total equals anchor costs plus per-interval DP optimum",
+        body["total_cost"] == expected_anchored_cost(left, right, anchors)
+        and sum(s["cost"] for s in body["steps"]) == body["total_cost"],
+        f"total={body.get('total_cost')} "
+        f"expected={expected_anchored_cost(left, right, anchors)}",
+    )
+
+    # Out-of-range and reused indices each fail exactly once.
+    status, body = http(
+        "POST", f"{API_URL}/api/align",
+        {**base, "anchors": [{"left": 99, "right": 0}]},
+    )
+    check(
+        "anchors: out-of-range index fails once at anchors[0].left",
+        status == 422
+        and set(body) == {"error", "path"}
+        and body["path"] == "anchors[0].left",
+        f"body={body}",
+    )
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            **base,
+            "anchors": [
+                {"left": 0, "right": 0},
+                {"left": 0, "right": 1},
+            ],
+        },
+    )
+    check(
+        "anchors: reused index fails once at anchors[1].left",
+        status == 422 and body["path"] == "anchors[1].left",
+        f"body={body}",
+    )
+
+    # Guarantee 3: crossing anchors produce a single error on the first
+    # offending anchor, never a possibly-valid timeline.
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            **base,
+            "anchors": [
+                {"left": 0, "right": 0},
+                {"left": 2, "right": 2},
+                {"left": 1, "right": 1},
+            ],
+        },
+    )
+    check(
+        "anchors: crossing pair fails once at anchors[2].left, no timeline",
+        status == 422
+        and set(body) == {"error", "path"}
+        and body["path"] == "anchors[2].left"
+        and "steps" not in body,
+        f"body={body}",
+    )
+
+    # Guarantee 4: cancelling the anchors (re-request without them) restores
+    # the original free result exactly.
+    status, restored = http("POST", f"{API_URL}/api/align", base)
+    check(
+        "anchors: cancelling anchors restores the original result",
+        status == 200 and restored == free_body,
+    )
+
+
 def main() -> int:
     # 1. API health
     status, body = http("GET", f"{API_URL}/health")
@@ -314,6 +473,9 @@ def main() -> int:
     for _ in range(3):
         _, again = http("POST", f"{API_URL}/api/align", payload)
     check("repeated runs return an identical unique timeline", again == first)
+
+    # 8. Human-confirmed anchors.
+    run_anchor_checks(left, right, first)
 
     print(f"\n{checks - len(failures)}/{checks} checks passed.")
     if failures:

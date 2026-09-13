@@ -84,6 +84,86 @@ describe("alignNotes", () => {
     expect(sentBody).toContain("9007199254740995");
   });
 
+  it("omits anchors entirely when none are given (legacy request body)", async () => {
+    let sentBody = "";
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      sentBody = init!.body as string;
+      return jsonResponse(alignedBody);
+    });
+    await alignNotes("[]", "[]", fetchMock as unknown as typeof fetch);
+    expect(sentBody).toBe(`{"left":[],"right":[]}`);
+    expect(sentBody).not.toContain("anchors");
+
+    // Explicit undefined behaves the same.
+    await alignNotes("[]", "[]", fetchMock as unknown as typeof fetch, undefined);
+    expect(sentBody).toBe(`{"left":[],"right":[]}`);
+  });
+
+  it("sends the anchors array when provided, including an empty list", async () => {
+    const bodies: string[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      bodies.push(init!.body as string);
+      return jsonResponse({ ...alignedBody, anchors: [{ left: 0, right: 1 }] });
+    });
+    await alignNotes(
+      `[{"time":1,"text":"a"}]`,
+      `[{"time":2,"text":"a"}]`,
+      fetchMock as unknown as typeof fetch,
+      [{ left: 0, right: 1 }],
+    );
+    expect(bodies[0]).toBe(
+      `{"left":[{"time":1,"text":"a"}],"right":[{"time":2,"text":"a"}],"anchors":[{"left":0,"right":1}]}`,
+    );
+
+    // An empty (but present) list is forwarded and still switches on anchors.
+    await alignNotes("[]", "[]", fetchMock as unknown as typeof fetch, []);
+    expect(bodies[1]).toBe(`{"left":[],"right":[],"anchors":[]}`);
+  });
+
+  it("returns the echoed anchors and per-row origin", async () => {
+    const body = {
+      steps: [
+        {
+          action: "match",
+          left: { time: 1, text: "a" },
+          right: { time: 2, text: "a" },
+          cost: 1,
+          cumulative_cost: 1,
+          origin: "anchor",
+        },
+      ],
+      total_cost: 1,
+      counts: { match: 1, left_gap: 0, right_gap: 0 },
+      anchors: [{ left: 0, right: 0 }],
+      costs: { gap: 2000, mismatch_penalty: 3000 },
+    };
+    const result = await alignNotes(
+      "[]",
+      "[]",
+      vi.fn(async () => jsonResponse(body)) as unknown as typeof fetch,
+      [{ left: 0, right: 0 }],
+    );
+    expect(result.anchors).toEqual([{ left: 0, right: 0 }]);
+    expect(result.steps[0].origin).toBe("anchor");
+  });
+
+  it("surfaces a single anchor error path on 422", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ error: "锚点交叉", path: "anchors[1].left" }, 422),
+    );
+    await expect(
+      alignNotes(
+        "[]",
+        "[]",
+        fetchMock as unknown as typeof fetch,
+        [
+          { left: 0, right: 0 },
+          { left: 0, right: 1 },
+        ],
+      ),
+    ).rejects.toMatchObject({ path: "anchors[1].left", status: 422 });
+  });
+
   it("surfaces a single error path on 422", async () => {
     const fetchMock = vi.fn(async () =>
       jsonResponse({ error: "未严格递增", path: "left[2].time" }, 422),

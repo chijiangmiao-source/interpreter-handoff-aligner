@@ -27,7 +27,6 @@ def _is_plain_int(value: Any) -> bool:
     # bool is a subclass of int in Python; JSON true/false are not timestamps.
     return isinstance(value, int) and not isinstance(value, bool)
 
-
 def validate_sequence(seq: Any, side: str) -> str | None:
     """Return the first error path, or None when the sequence is valid."""
     prefix = side
@@ -65,3 +64,83 @@ def validate_sequence(seq: Any, side: str) -> str | None:
         prev_time = time_value
 
     return None
+
+
+def validate_anchors(
+    anchors: Any, m: int, n: int
+) -> tuple[str | None, str | None]:
+    """Validate the optional ``anchors`` array against two valid sequences.
+
+    ``m`` and ``n`` are the lengths of the already-validated left and right
+    arrays.  Each anchor must be an object containing only integer ``left``
+    and ``right`` 0-based record indices.  Indices must exist (in range), no
+    index may be reused, and successive anchors must grow on BOTH sides (so the
+    forced matches never cross).
+
+    Returns ``(error_path, error_message)``; on success both are ``None``.
+    Exactly one failure is ever produced: anchors are examined in the order
+    the client sent them, and the first definite error wins.  The returned
+    path points at the offending anchor entry (e.g. ``anchors[1].left`` or
+    ``anchors[2]``).
+    """
+    if not isinstance(anchors, list):
+        return "anchors", "anchors 必须是数组。"
+
+    seen_left: set[int] = set()
+    seen_right: set[int] = set()
+    prev_left: int | None = None
+    prev_right: int | None = None
+
+    for k, anchor in enumerate(anchors):
+        base = f"anchors[{k}]"
+
+        if not isinstance(anchor, dict):
+            return base, f"{base} 必须是包含 left 与 right 索引的对象。"
+
+        # Reject unknown keys up front so a typo is not silently ignored.
+        extra = [key for key in anchor if key not in ("left", "right")]
+        if extra:
+            return f"{base}.{extra[0]}", f"{base}.{extra[0]} 是多余字段。"
+
+        for side, length, seen in (
+            ("left", m, seen_left),
+            ("right", n, seen_right),
+        ):
+            if side not in anchor:
+                return f"{base}.{side}", f"{base} 缺少整数记录索引 {side}。"
+            value = anchor[side]
+            if not _is_plain_int(value):
+                return f"{base}.{side}", f"{base}.{side} 必须是非负整数记录索引。"
+            if value < 0 or value >= length:
+                range_text = f"，合法范围 0..{length - 1}" if length else "，该侧没有任何记录"
+                return (
+                    f"{base}.{side}",
+                    f"{base}.{side} 索引 {value} 越界"
+                    f"（{side} 共 {length} 项{range_text}）。",
+                )
+            if value in seen:
+                return (
+                    f"{base}.{side}",
+                    f"{base}.{side} 索引 {value} 已被其他锚点配对，不可复用。",
+                )
+
+        li, ri = anchor["left"], anchor["right"]
+
+        # Monotonic on both sides. Equalities were already returned as reuse
+        # errors above, so a non-greater value here is a strict decrease, i.e.
+        # the new anchor crosses (or runs backward against) the previous one.
+        if prev_left is not None and prev_right is not None and (
+            li < prev_left or ri < prev_right
+        ):
+            offender = "left" if li < prev_left else "right"
+            return (
+                f"{base}.{offender}",
+                f"{base} 与锚点顺序交叉：({li}, {ri}) 未同时晚于上一锚点 "
+                f"({prev_left}, {prev_right})，左右索引都必须严格递增。",
+            )
+
+        seen_left.add(li)
+        seen_right.add(ri)
+        prev_left, prev_right = li, ri
+
+    return None, None

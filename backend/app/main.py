@@ -3,7 +3,15 @@
 The only business endpoint is ``POST /api/align`` accepting::
 
     {"left": [{"time": int, "text": str}, ...],
-     "right": [{"time": int, "text": str}, ...]}
+     "right": [{"time": int, "text": str}, ...],
+     "anchors": [{"left": int, "right": int}, ...]}   # optional
+
+``anchors`` is optional.  When present, each entry pins a human-confirmed
+pair of 0-based record indices; the service re-runs the same DP on the
+intervals the anchors cut out.  Bad anchors (out of range, reused index,
+crossing/non-monotonic order) fail exactly once with a path such as
+``anchors[1].left``.  Requests without ``anchors`` keep their historical
+behaviour and response shape exactly.
 
 Malformed JSON and every structural/semantic violation (wrong type, too many
 items, missing/empty field, duplicate or non-increasing time, unknown field)
@@ -22,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .alignment import align
-from .validation import MAX_ITEMS, validate_sequence
+from .validation import MAX_ITEMS, validate_anchors, validate_sequence
 
 app = FastAPI(title="Interpreter Handoff Aligner", version="1.0.0")
 
@@ -70,7 +78,26 @@ async def align_notes(request: Request) -> JSONResponse:
         if bad_path is not None:
             return _failure(422, _describe(payload[side], bad_path, side), bad_path)
 
-    result = align(payload["left"], payload["right"])
+    # Optional anchors are only consulted once both sequences are valid, since
+    # index bounds depend on their lengths.  Absent anchors keep the legacy
+    # request/response contract exactly; an explicitly present (even empty)
+    # array switches on anchor provenance.
+    anchors_given = "anchors" in payload
+    anchor_pairs: list[tuple[int, int]] = []
+    if anchors_given:
+        anchors_raw = payload["anchors"]
+        bad_path, bad_message = validate_anchors(
+            anchors_raw, len(payload["left"]), len(payload["right"])
+        )
+        if bad_path is not None:
+            return _failure(422, bad_message, bad_path)
+        anchor_pairs = [(a["left"], a["right"]) for a in anchors_raw]
+
+    result = align(
+        payload["left"],
+        payload["right"],
+        anchors=anchor_pairs if anchors_given else None,
+    )
     return JSONResponse(result)
 
 

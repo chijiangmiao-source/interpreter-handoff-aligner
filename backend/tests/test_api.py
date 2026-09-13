@@ -154,3 +154,164 @@ def test_response_shape_contains_replay_fields():
     }
     assert step["cumulative_cost"] == step["cost"] == data["total_cost"]
     assert data["costs"] == {"gap": 2000, "mismatch_penalty": 3000}
+
+
+# --------------------------------------------------------------------------- #
+# Optional anchors.
+# --------------------------------------------------------------------------- #
+
+
+def test_request_without_anchors_is_byte_shape_compatible():
+    payload = {
+        "left": [{"time": 0, "text": "a"}, {"time": 5000, "text": "b"}],
+        "right": [{"time": 10, "text": "a"}, {"time": 5200, "text": "b"}],
+    }
+    legacy = post(payload).json()
+    # No anchors key anywhere, no per-row origin: the historical response.
+    assert "anchors" not in legacy
+    assert all("origin" not in s for s in legacy["steps"])
+    # An explicitly empty anchors array is the same legacy request/response.
+    assert post({**payload, "anchors": []}).json() == legacy
+
+
+def test_valid_anchor_is_fixed_into_timeline_and_tagged():
+    payload = {
+        "left": [
+            {"time": 0, "text": "a"},
+            {"time": 5000, "text": "b"},
+            {"time": 9000, "text": "c"},
+        ],
+        "right": [
+            {"time": 10, "text": "a"},
+            {"time": 4000, "text": "x"},
+            {"time": 5200, "text": "b"},
+        ],
+        "anchors": [{"left": 2, "right": 1}],
+    }
+    resp = post(payload)
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()
+    assert data["anchors"] == [{"left": 2, "right": 1}]
+    anchor_rows = [s for s in data["steps"] if s["origin"] == "anchor"]
+    auto_rows = [s for s in data["steps"] if s["origin"] == "auto"]
+    assert len(anchor_rows) == 1
+    row = anchor_rows[0]
+    assert row["action"] == "match"
+    assert row["left"] == {"time": 9000, "text": "c"}
+    assert row["right"] == {"time": 4000, "text": "x"}
+    # Forced distant, different-text pair costs |dt| + 3000.
+    assert row["cost"] == 5000 + 3000
+    assert auto_rows and all(s["origin"] == "auto" for s in auto_rows)
+    # Steps still replay exactly to the anchored total.
+    assert sum(s["cost"] for s in data["steps"]) == data["total_cost"]
+
+
+def test_two_anchors_split_intervals_and_keep_optimum():
+    payload = {
+        "left": [
+            {"time": 0, "text": "a"},
+            {"time": 5000, "text": "b"},
+            {"time": 9000, "text": "c"},
+        ],
+        "right": [
+            {"time": 10, "text": "a"},
+            {"time": 4000, "text": "x"},
+            {"time": 5200, "text": "b"},
+        ],
+        "anchors": [{"left": 0, "right": 0}, {"left": 2, "right": 1}],
+    }
+    data = post(payload).json()
+    origins = [s["origin"] for s in data["steps"]]
+    assert origins.count("anchor") == 2
+    # Anchor rows are pinned to the confirmed records.
+    anchor_rows = [s for s in data["steps"] if s["origin"] == "anchor"]
+    assert [s["left"]["time"] for s in anchor_rows] == [0, 9000]
+    assert [s["right"]["time"] for s in anchor_rows] == [10, 4000]
+
+
+def test_anchor_out_of_range_is_single_error_and_no_timeline():
+    payload = {
+        "left": [{"time": 1, "text": "a"}],
+        "right": [{"time": 2, "text": "b"}],
+        "anchors": [{"left": 1, "right": 0}],
+    }
+    resp = post(payload)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert set(body) == {"error", "path"}
+    assert body["path"] == "anchors[0].left"
+    assert "越界" in body["error"]
+
+
+def test_crossing_anchors_fail_once_at_first_offending_anchor():
+    payload = {
+        "left": [{"time": i, "text": "x"} for i in range(3)],
+        "right": [{"time": i, "text": "x"} for i in range(3)],
+        "anchors": [
+            {"left": 0, "right": 0},
+            {"left": 2, "right": 2},
+            {"left": 1, "right": 1},  # crosses the previous anchor
+        ],
+    }
+    resp = post(payload)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["path"] == "anchors[2].left"
+    assert "交叉" in body["error"]
+    # Exactly one failure object, never a partial/possibly-valid timeline.
+    assert set(body) == {"error", "path"}
+
+
+def test_reused_anchor_index_fails_once():
+    payload = {
+        "left": [{"time": i, "text": "x"} for i in range(3)],
+        "right": [{"time": i, "text": "x"} for i in range(3)],
+        "anchors": [{"left": 0, "right": 0}, {"left": 0, "right": 1}],
+    }
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["path"] == "anchors[1].left"
+
+
+def test_anchors_wrong_shape_failures():
+    base = {
+        "left": [{"time": 1, "text": "a"}],
+        "right": [{"time": 2, "text": "b"}],
+    }
+    cases = [
+        ("x", "anchors"),
+        ([5], "anchors[0]"),
+        ([{}], "anchors[0].left"),
+        ([{"left": 0}], "anchors[0].right"),
+        ([{"left": 0, "right": 0, "x": 1}], "anchors[0].x"),
+        ([{"left": True, "right": 0}], "anchors[0].left"),
+    ]
+    for anchors, expected_path in cases:
+        resp = post({**base, "anchors": anchors})
+        assert resp.status_code == 422
+        assert resp.json()["path"] == expected_path, (anchors, resp.json())
+
+
+def test_sequence_error_is_reported_before_anchor_error():
+    # Both the left sequence and the anchors are bad; validation order is
+    # fixed (sequences first, left before right, then anchors).
+    payload = {
+        "left": [{"time": 1, "text": ""}],
+        "right": [],
+        "anchors": [{"left": 9, "right": 9}],
+    }
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["path"] == "left[0].text"
+
+
+def test_cancelling_anchors_restores_free_result():
+    payload = {
+        "left": [{"time": 0, "text": "a"}, {"time": 9000, "text": "b"}],
+        "right": [{"time": 10, "text": "b"}, {"time": 8999, "text": "a"}],
+    }
+    free = post(payload).json()
+    anchored = post({**payload, "anchors": [{"left": 0, "right": 1}]}).json()
+    assert anchored["total_cost"] >= free["total_cost"]
+    # Re-requesting with the anchor removed returns the identical free result.
+    assert post(payload).json() == free

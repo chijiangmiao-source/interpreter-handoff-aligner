@@ -49,6 +49,47 @@ function mockFetchOnce(body: unknown, status = 200) {
   ) as unknown as typeof fetch;
 }
 
+const anchoredBody = {
+  steps: [
+    {
+      action: "match",
+      left: { time: 0, text: "各位媒体朋友下午好" },
+      right: { time: 150, text: "各位媒体朋友下午好" },
+      cost: 150,
+      cumulative_cost: 150,
+      origin: "anchor",
+    },
+    {
+      action: "match",
+      left: { time: 4200, text: "新产品将于下月上市" },
+      right: { time: 4100, text: "新产品将于下月上市" },
+      cost: 100,
+      cumulative_cost: 250,
+      origin: "auto",
+    },
+    {
+      action: "right_gap",
+      left: { time: 9000, text: "感谢各位的提问" },
+      right: null,
+      cost: 2000,
+      cumulative_cost: 2250,
+      origin: "auto",
+    },
+    {
+      action: "left_gap",
+      left: null,
+      right: { time: 12000, text: "交接后的补充记录" },
+      cost: 2000,
+      cumulative_cost: 4250,
+      origin: "auto",
+    },
+  ],
+  total_cost: 4250,
+  counts: { match: 2, left_gap: 1, right_gap: 1 },
+  anchors: [{ left: 0, right: 0 }],
+  costs: { gap: 2000, mismatch_penalty: 3000 },
+};
+
 describe("App", () => {
   it("renders both JSON inputs and sample data on load", () => {
     render(<App />);
@@ -241,5 +282,165 @@ describe("App", () => {
     expect(sentBody).toContain("9007199254740993");
     expect(sentBody).toContain("9007199254740995");
     vi.unstubAllGlobals();
+  });
+
+  // ------------------------------------------------------------------ //
+  // Human-confirmed anchors.
+  // ------------------------------------------------------------------ //
+
+  it("renders the anchor picker with one row per parsed record", () => {
+    render(<App />);
+    expect(screen.getByTestId("anchor-panel")).toBeInTheDocument();
+    // No anchors yet: the empty state is shown and there are no anchor rows.
+    expect(screen.getByTestId("anchor-empty")).toBeInTheDocument();
+    expect(screen.queryAllByTestId("anchor-item")).toHaveLength(0);
+    // Sample data has 3 records on each side.
+    expect(screen.getByTestId("pick-left-0")).toBeInTheDocument();
+    expect(screen.getByTestId("pick-right-2")).toBeInTheDocument();
+  });
+
+  it("pins a pair by clicking one record on each side and lists it", () => {
+    render(<App />);
+    fireEvent.click(screen.getByTestId("pick-left-1"));
+    fireEvent.click(screen.getByTestId("pick-right-1"));
+
+    const items = screen.getAllByTestId("anchor-item");
+    expect(items).toHaveLength(1);
+    expect(items[0]).toHaveTextContent("left[1]");
+    expect(items[0]).toHaveTextContent("right[1]");
+    // The picked records are shown as used.
+    expect(screen.getByTestId("pick-left-1")).toHaveAttribute("data-used", "true");
+    expect(screen.getByTestId("pick-right-1")).toHaveAttribute("data-used", "true");
+  });
+
+  it("rejects a crossing pair locally without adding it", () => {
+    render(<App />);
+    // First valid anchor (1, 1).
+    fireEvent.click(screen.getByTestId("pick-left-1"));
+    fireEvent.click(screen.getByTestId("pick-right-1"));
+    // Then pick left 2 ... and right 0 -> right must grow, so this crosses.
+    fireEvent.click(screen.getByTestId("pick-left-2"));
+    fireEvent.click(screen.getByTestId("pick-right-0"));
+
+    expect(screen.getByTestId("anchor-pick-error")).toBeInTheDocument();
+    // Only the first anchor remains; right[0] is not consumed.
+    expect(screen.getAllByTestId("anchor-item")).toHaveLength(1);
+    expect(screen.getByTestId("pick-right-0")).toHaveAttribute("data-used", "false");
+  });
+
+  it("sends anchors on submit, then shows anchor vs auto origins", async () => {
+    vi.stubGlobal("fetch", mockFetchOnce(anchoredBody));
+    render(<App />);
+    fireEvent.click(screen.getByTestId("pick-left-0"));
+    fireEvent.click(screen.getByTestId("pick-right-0"));
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    const rows = screen.getAllByTestId("timeline-row");
+    expect(rows[0]).toHaveAttribute("data-origin", "anchor");
+    expect(rows[1]).toHaveAttribute("data-origin", "auto");
+    const origins = screen.getAllByTestId("step-origin").map((el) => el.textContent);
+    expect(origins).toEqual(["人工锚点", "算法生成", "算法生成", "算法生成"]);
+    expect(screen.getByTestId("legend-anchors")).toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
+  it("omits anchors from the request when none are marked (legacy body)", async () => {
+    let sentBody = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sentBody = init!.body as string;
+        return new Response(JSON.stringify(okBody), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    render(<App />);
+    fireEvent.click(screen.getByTestId("submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    expect(sentBody).not.toContain("anchors");
+    // Unanchored rows carry no provenance tag.
+    expect(screen.queryAllByTestId("step-origin")).toHaveLength(0);
+    vi.unstubAllGlobals();
+  });
+
+  it("flags the offending anchor on a 422 and keeps inputs and markers", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockFetchOnce(
+        { error: "锚点顺序交叉", path: "anchors[1].left" },
+        422,
+      ),
+    );
+    render(<App />);
+    // Two markers are selected before submit.
+    fireEvent.click(screen.getByTestId("pick-left-0"));
+    fireEvent.click(screen.getByTestId("pick-right-0"));
+    fireEvent.click(screen.getByTestId("pick-left-2"));
+    fireEvent.click(screen.getByTestId("pick-right-2"));
+    const leftBefore = (screen.getByTestId("input-left") as HTMLTextAreaElement).value;
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("error-banner")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("error-path").textContent).toContain("anchors[1].left");
+    // No possibly-valid timeline is shown.
+    expect(screen.queryByTestId("result-panel")).toBeNull();
+    // Both inputs and both selected markers survive.
+    expect((screen.getByTestId("input-left") as HTMLTextAreaElement).value).toBe(
+      leftBefore,
+    );
+    expect(screen.getAllByTestId("anchor-item")).toHaveLength(2);
+    const items = screen.getAllByTestId("anchor-item");
+    expect(items[1]).toHaveClass("invalid");
+    expect(screen.getByTestId("anchor-error")).toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
+  it("unpinning an anchor removes it; resubmitting sends the rest", async () => {
+    let sentBody = "";
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      sentBody = init!.body as string;
+      return new Response(JSON.stringify(anchoredBody), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+    fireEvent.click(screen.getByTestId("pick-left-0"));
+    fireEvent.click(screen.getByTestId("pick-right-0"));
+    expect(screen.getAllByTestId("anchor-item")).toHaveLength(1);
+
+    // Remove via the row's cancel button.
+    fireEvent.click(screen.getByTestId("anchor-remove-0"));
+    expect(screen.queryAllByTestId("anchor-item")).toHaveLength(0);
+    expect(screen.getByTestId("anchor-empty")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    // Cancelling every anchor restores the original (anchor-free) request.
+    expect(sentBody).not.toContain("anchors");
+    vi.unstubAllGlobals();
+  });
+
+  it("clears anchors when loading the sample or clearing", () => {
+    render(<App />);
+    fireEvent.click(screen.getByTestId("pick-left-0"));
+    fireEvent.click(screen.getByTestId("pick-right-0"));
+    expect(screen.getAllByTestId("anchor-item")).toHaveLength(1);
+    fireEvent.click(screen.getByTestId("clear"));
+    expect(screen.queryAllByTestId("anchor-item")).toHaveLength(0);
+    // Empty arrays leave no pickable records.
+    expect(screen.queryByTestId("pick-left-0")).toBeNull();
   });
 });

@@ -1,11 +1,14 @@
-"""Unit tests for the DP alignment algorithm and its tie-breaking."""
+"""Unit tests for the DP alignment algorithm, tie-breaking and anchors."""
 
 import itertools
+import random
 from functools import lru_cache
 
 from app.alignment import (
     GAP_COST,
     MISMATCH_PENALTY,
+    ORIGIN_ANCHOR,
+    ORIGIN_AUTO,
     align,
 )
 
@@ -205,3 +208,215 @@ def test_optimal_cost_against_brute_force():
                             assert result["total_cost"] == brute(left, right)
                             cases += 1
     assert cases > 1000
+
+
+# --------------------------------------------------------------------------- #
+# Anchors: human-confirmed pairs that split the grid into independent DP runs.
+# --------------------------------------------------------------------------- #
+
+
+def _unanchored_segment_cost(
+    left: list[dict], right: list[dict], lo: int, hi: int
+) -> int:
+    """Independent optimum for the open interval between two anchors.
+
+    ``lo``/``hi`` are ``(left_index, right_index)`` pairs of the bounding
+    anchors, using (-1, -1) before the first and (m, n) after the last; the
+    bounding notes themselves are NOT included.  A plain recursion over the
+    sub-arrays gives a check independent of the segment DP under test.
+    """
+    sub_l = left[lo[0] + 1 : hi[0]]
+    sub_r = right[lo[1] + 1 : hi[1]]
+
+    @lru_cache(maxsize=None)
+    def opt(i: int, j: int) -> float:
+        if i == len(sub_l) and j == len(sub_r):
+            return 0
+        best = float("inf")
+        if i < len(sub_l) and j < len(sub_r):
+            a, b = sub_l[i], sub_r[j]
+            c = abs(a["time"] - b["time"]) + (
+                0 if a["text"] == b["text"] else MISMATCH_PENALTY
+            )
+            best = min(best, c + opt(i + 1, j + 1))
+        if i < len(sub_l):
+            best = min(best, GAP_COST + opt(i + 1, j))
+        if j < len(sub_r):
+            best = min(best, GAP_COST + opt(i, j + 1))
+        return best
+
+    return int(opt(0, 0))
+
+
+def constrained_brute(
+    left: list[dict], right: list[dict], anchors: list[tuple[int, int]]
+) -> int:
+    """Minimum cost among paths forced through every anchor pair."""
+    m, n = len(left), len(right)
+    bounds = [(-1, -1), *sorted(anchors), (m, n)]
+    total = 0
+    for lo, hi in zip(bounds, bounds[1:]):
+        total += _unanchored_segment_cost(left, right, lo, hi)
+        if hi != (m, n):  # hi is a real anchor: add its forced match cost
+            a, b = left[hi[0]], right[hi[1]]
+            total += abs(a["time"] - b["time"]) + (
+                0 if a["text"] == b["text"] else MISMATCH_PENALTY
+            )
+    return total
+
+
+def _assert_valid_timeline(result, left, right, anchors: list[tuple[int, int]]):
+    """Invariants every (anchored) timeline must satisfy."""
+    m, n = len(left), len(right)
+    steps = result["steps"]
+    # Costs replay to the advertised total.
+    assert sum(s["cost"] for s in steps) == result["total_cost"]
+    cum = 0
+    for s in steps:
+        cum += s["cost"]
+        assert s["cumulative_cost"] == cum
+    # Every note is consumed exactly once, in order; blank-side naming holds.
+    left_times = [s["left"]["time"] for s in steps if s["left"]]
+    right_times = [s["right"]["time"] for s in steps if s["right"]]
+    assert left_times == [item["time"] for item in left]
+    assert right_times == [item["time"] for item in right]
+    for s in steps:
+        if s["action"] == "left_gap":
+            assert s["left"] is None and s["right"] is not None
+        elif s["action"] == "right_gap":
+            assert s["right"] is None and s["left"] is not None
+        else:
+            assert s["left"] is not None and s["right"] is not None
+    # Every anchor appears, in order, as a match tagged "anchor", pinned to the
+    # exact record indices the caller confirmed.
+    anchor_rows = [s for s in steps if s.get("origin") == ORIGIN_ANCHOR]
+    assert len(anchor_rows) == len(anchors)
+    for (ai, aj), row in zip(anchors, anchor_rows):
+        assert row["action"] == "match"
+        assert row["left"] == left[ai]
+        assert row["right"] == right[aj]
+    # With any anchor present every non-anchor row is algorithm-generated;
+    # with no anchors the legacy shape omits provenance entirely.
+    if anchors:
+        assert all(
+            s.get("origin") == ORIGIN_AUTO
+            for s in steps
+            if s.get("origin") != ORIGIN_ANCHOR
+        )
+    else:
+        assert all("origin" not in s for s in steps)
+    assert result["counts"] == {
+        "match": sum(1 for s in steps if s["action"] == "match"),
+        "left_gap": sum(1 for s in steps if s["action"] == "left_gap"),
+        "right_gap": sum(1 for s in steps if s["action"] == "right_gap"),
+    }
+
+
+def test_no_anchors_keeps_legacy_response_shape():
+    left = [note(0, "a"), note(5000, "b")]
+    right = [note(10, "a"), note(5200, "b")]
+    result = align(left, right)
+    assert set(result.keys()) == {"steps", "total_cost", "counts", "costs"}
+    for step in result["steps"]:
+        assert set(step.keys()) == {
+            "action",
+            "left",
+            "right",
+            "cost",
+            "cumulative_cost",
+        }
+    # Passing anchors=None or an empty list is the same legacy request.
+    assert align(left, right, None) == result
+    assert align(left, right, []) == result
+
+
+def test_single_anchor_is_forced_tagged_and_present():
+    left = [note(0, "a"), note(5000, "b"), note(9000, "c")]
+    right = [note(10, "a"), note(4000, "x"), note(5200, "b")]
+    result = align(left, right, anchors=[(2, 1)])  # force 9000/c <-> 4000/x
+
+    assert result["anchors"] == [{"left": 2, "right": 1}]
+    anchor_rows = [s for s in result["steps"] if s["origin"] == ORIGIN_ANCHOR]
+    auto_rows = [s for s in result["steps"] if s["origin"] == ORIGIN_AUTO]
+    assert len(anchor_rows) == 1
+    assert anchor_rows[0]["left"] == note(9000, "c")
+    assert anchor_rows[0]["right"] == note(4000, "x")
+    # A forced pair is a match even though the free optimum would never pair
+    # these distant, different-text notes.
+    assert anchor_rows[0]["action"] == "match"
+    assert anchor_rows[0]["cost"] == abs(9000 - 4000) + MISMATCH_PENALTY
+    assert auto_rows and all(s["origin"] == ORIGIN_AUTO for s in auto_rows)
+    _assert_valid_timeline(result, left, right, [(2, 1)])
+
+
+def test_anchor_total_equals_anchor_cost_plus_optimal_segments():
+    left = [note(0, "a"), note(5000, "b"), note(9000, "c")]
+    right = [note(10, "a"), note(4000, "x"), note(5200, "b")]
+    anchors = [(0, 0), (2, 1)]
+    result = align(left, right, anchors=anchors)
+    assert result["total_cost"] == constrained_brute(left, right, anchors)
+    _assert_valid_timeline(result, left, right, anchors)
+
+    # The two anchor rows sit at their forced positions in chronological order.
+    anchor_rows = [s for s in result["steps"] if s["origin"] == ORIGIN_ANCHOR]
+    assert [r["left"]["time"] for r in anchor_rows] == [0, 9000]
+    assert [r["right"]["time"] for r in anchor_rows] == [10, 4000]
+
+
+def test_anchor_consistent_with_global_optimum_when_it_agrees():
+    # The free optimum already pairs equal-text same-position notes; pinning
+    # those pairs must leave the timeline and total exactly unchanged.
+    left = [note(0, "a"), note(5000, "b")]
+    right = [note(100, "a"), note(4900, "b")]
+    free = align(left, right)
+    pinned = align(left, right, anchors=[(0, 0), (1, 1)])
+    assert pinned["total_cost"] == free["total_cost"] == 200
+    assert [
+        (s["action"], s["cost"], s.get("origin")) for s in pinned["steps"]
+    ] == [
+        ("match", 100, ORIGIN_ANCHOR),
+        ("match", 100, ORIGIN_ANCHOR),
+    ]
+
+
+def test_anchored_optimum_exhaustive_against_independent_recursion():
+    rng = random.Random(20260913)
+    cases = 0
+    for trial in range(400):
+        m = rng.randrange(0, 6)
+        n = rng.randrange(0, 6)
+        left = []
+        t = 0
+        for i in range(m):
+            t += rng.randrange(0, 7000)
+            left.append(note(t, rng.choice(("a", "b"))))
+        right = []
+        t = 0
+        for j in range(n):
+            t += rng.randrange(0, 7000)
+            right.append(note(t, rng.choice(("a", "b"))))
+
+        # Choose a random monotonic set of forced pairs.
+        k = rng.randrange(0, min(m, n) + 1)
+        li = sorted(rng.sample(range(m), k)) if k else []
+        rj = sorted(rng.sample(range(n), k)) if k else []
+        anchors = list(zip(li, rj))
+
+        result = align(left, right, anchors=anchors)
+        assert result["total_cost"] == constrained_brute(left, right, anchors)
+        _assert_valid_timeline(result, left, right, anchors)
+        cases += 1
+    assert cases == 400
+
+
+def test_removing_all_anchors_restores_free_result():
+    left = [note(0, "a"), note(9000, "b")]
+    right = [note(10, "b"), note(8999, "a")]
+    free = align(left, right)
+    constrained = align(left, right, anchors=[(0, 1)])
+    assert constrained["total_cost"] >= free["total_cost"]
+    # Cancelling the anchor (re-request without it) reproduces the free result
+    # bit for bit, including the absence of provenance fields.
+    again = align(left, right, None)
+    assert again == free
+    assert all("origin" not in s for s in again["steps"])

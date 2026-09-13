@@ -167,8 +167,198 @@ test("only-left notes label the right side as blank and carry content on the lef
   await expect(row).toHaveCount(1);
   await expect(row).toHaveAttribute("data-action", "right_gap");
   // Left cell shows the note, right cell shows the empty marker.
+  // Columns: # | left | action | source(origin) | right | cost | cumulative | explain
   const cells = row.locator("td");
   await expect(cells.nth(1)).toContainText("仅左侧记录");
-  await expect(cells.nth(3)).toContainText("∅");
+  await expect(cells.nth(4)).toContainText("∅");
   await expect(page.getByTestId("step-cost")).toHaveText("2000");
+});
+
+test("a marked anchor is fixed into the timeline and styled vs generated rows", async ({
+  page,
+}) => {
+  // Pin left[0] <-> right[0] (the identical opening greetings).
+  await page.getByTestId("pick-left-0").click();
+  await page.getByTestId("pick-right-0").click();
+  await expect(page.getByTestId("anchor-item")).toHaveCount(1);
+
+  await page.getByTestId("submit").click();
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+
+  const rows = page.getByTestId("timeline-row");
+  await expect(rows).toHaveCount(4);
+  // The first row is the human-confirmed anchor; the rest are generated.
+  await expect(rows.nth(0)).toHaveAttribute("data-origin", "anchor");
+  await expect(rows.nth(1)).toHaveAttribute("data-origin", "auto");
+  await expect(rows.nth(2)).toHaveAttribute("data-origin", "auto");
+  await expect(rows.nth(3)).toHaveAttribute("data-origin", "auto");
+  await expect(page.getByTestId("step-origin").nth(0)).toHaveText("人工锚点");
+  await expect(page.getByTestId("step-origin").nth(1)).toHaveText("算法生成");
+  await expect(page.getByTestId("legend-anchors")).toBeVisible();
+  // The anchor pair is the one confirmed, and step costs still sum to total.
+  await expect(rows.nth(0)).toContainText("各位媒体朋友下午好");
+  const costs = await page.getByTestId("step-cost").allInnerTexts();
+  expect(costs.map(Number).reduce((a, b) => a + b, 0)).toBe(4250);
+  await expect(page.getByTestId("total-cost")).toHaveText("4250");
+});
+
+test("forcing a non-obvious anchor changes the alignment and pins the pair", async ({
+  page,
+}) => {
+  // Free optimum pairs equal texts. Force left[2] (感谢各位的提问) with
+  // right[1] (新产品将于下月上市): a distant, different-text match.
+  await page.getByTestId("pick-left-2").click();
+  await page.getByTestId("pick-right-1").click();
+  await page.getByTestId("submit").click();
+
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  const anchorRows = page.locator('[data-testid="timeline-row"][data-origin="anchor"]');
+  await expect(anchorRows).toHaveCount(1);
+  const row = anchorRows.first();
+  await expect(row).toContainText("感谢各位的提问");
+  await expect(row).toContainText("新产品将于下月上市");
+  // |9000 - 4100| + 3000 mismatch = 7900
+  await expect(row.getByTestId("step-cost")).toHaveText("7900");
+});
+
+test("crossing anchors fail once, keep inputs and markers, show no timeline", async ({
+  page,
+}) => {
+  // The local picker refuses to add a crossing pair, so a cross can only reach
+  // the server from a stale/raced selection. Simulate that single 422 to
+  // assert the page's failure UX (real cross is covered by the live-API test).
+  await page.route("**/api/align", async (route) => {
+    await route.fulfill({
+      status: 422,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: "anchors[1] 与锚点顺序交叉。",
+        path: "anchors[1].left",
+      }),
+    });
+  });
+
+  await page.getByTestId("pick-left-0").click();
+  await page.getByTestId("pick-right-0").click();
+  await page.getByTestId("pick-left-2").click();
+  await page.getByTestId("pick-right-2").click();
+  const leftBefore = await page.getByTestId("input-left").inputValue();
+
+  await page.getByTestId("submit").click();
+
+  await expect(page.getByTestId("error-banner")).toBeVisible();
+  await expect(page.getByTestId("error-path")).toContainText("anchors[1].left");
+  // Exactly one failure, no possibly-valid timeline.
+  await expect(page.getByTestId("result-panel")).toHaveCount(0);
+  // Current inputs and selected markers are retained.
+  expect(await page.getByTestId("input-left").inputValue()).toBe(leftBefore);
+  await expect(page.getByTestId("anchor-item")).toHaveCount(2);
+  // The offending (second) anchor is flagged beside it.
+  await expect(page.locator('[data-anchor-index="1"]')).toHaveClass(/invalid/);
+  await expect(page.getByTestId("anchor-error")).toBeVisible();
+});
+
+test("cancelling an anchor restores the original anchor-free result", async ({
+  page,
+}) => {
+  // Without anchors: 4 rows as the golden timeline, no provenance tags.
+  await page.getByTestId("submit").click();
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  expect(await page.getByTestId("step-origin").count()).toBe(0);
+
+  // Mark an anchor and realign: provenance appears.
+  await page.getByTestId("pick-left-0").click();
+  await page.getByTestId("pick-right-0").click();
+  await page.getByTestId("submit").click();
+  await expect(page.getByTestId("step-origin").first()).toHaveText("人工锚点");
+
+  // Cancel the anchor and submit again: back to the original result.
+  await page.getByTestId("anchor-remove-0").click();
+  await expect(page.getByTestId("anchor-item")).toHaveCount(0);
+  await page.getByTestId("submit").click();
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  expect(await page.getByTestId("step-origin").count()).toBe(0);
+  await expect(page.getByTestId("total-cost")).toHaveText("4250");
+});
+
+test("unanchored request omits anchors and shows no anchor legend", async ({
+  page,
+}) => {
+  const requests: string[] = [];
+  page.on("request", (req) => {
+    if (req.url().includes("/api/align")) requests.push(req.postData() ?? "");
+  });
+  await page.getByTestId("submit").click();
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  expect(requests[0]).not.toContain("anchors");
+  await expect(page.getByTestId("legend-anchors")).toHaveCount(0);
+});
+
+test("live API: valid anchors fix the pairs, crossing fails once, cancelling restores", async ({
+  request,
+}) => {
+  const payload = {
+    left: [
+      { time: 0, text: "a" },
+      { time: 5000, text: "b" },
+      { time: 9000, text: "c" },
+    ],
+    right: [
+      { time: 10, text: "a" },
+      { time: 4000, text: "x" },
+      { time: 5200, text: "b" },
+    ],
+  };
+
+  // 1) No anchors: legacy shape (no anchors field, no per-row origin).
+  const free = await request.post("/api/align", { data: payload });
+  expect(free.status()).toBe(200);
+  const freeBody = await free.json();
+  expect(freeBody.anchors).toBeUndefined();
+  expect(freeBody.steps.every((s: unknown) => !("origin" in (s as object)))).toBe(true);
+
+  // 2) Valid anchors are fixed into the result and tagged.
+  const anchored = await request.post("/api/align", {
+    data: { ...payload, anchors: [{ left: 0, right: 0 }, { left: 2, right: 1 }] },
+  });
+  expect(anchored.status()).toBe(200);
+  const anchoredBody = await anchored.json();
+  expect(anchoredBody.anchors).toEqual([
+    { left: 0, right: 0 },
+    { left: 2, right: 1 },
+  ]);
+  const anchorRows = anchoredBody.steps.filter(
+    (s: { origin?: string }) => s.origin === "anchor",
+  );
+  expect(anchorRows).toHaveLength(2);
+  expect(anchorRows.map((s: { left: { time: number } }) => s.left.time)).toEqual([
+    0, 9000,
+  ]);
+  // Per-step costs still replay to the exact total.
+  expect(
+    anchoredBody.steps.reduce(
+      (acc: number, s: { cost: number }) => acc + s.cost,
+      0,
+    ),
+  ).toBe(anchoredBody.total_cost);
+
+  // 3) Crossing anchors: exactly one 422 at the first offending anchor.
+  const crossed = await request.post("/api/align", {
+    data: {
+      ...payload,
+      anchors: [
+        { left: 0, right: 0 },
+        { left: 2, right: 2 },
+        { left: 1, right: 1 },
+      ],
+    },
+  });
+  expect(crossed.status()).toBe(422);
+  const crossedBody = await crossed.json();
+  expect(Object.keys(crossedBody).sort()).toEqual(["error", "path"]);
+  expect(crossedBody.path).toBe("anchors[2].left");
+
+  // 4) Cancelling anchors (re-request without them) restores the free result.
+  const restored = await request.post("/api/align", { data: payload });
+  expect(await restored.json()).toEqual(freeBody);
 });

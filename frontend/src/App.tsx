@@ -1,7 +1,9 @@
 import { useMemo, useState } from "react";
+import AnchorPanel, { type PickerNote } from "./AnchorPanel";
 import HighlightedTextarea from "./HighlightedTextarea";
 import ResultTimeline from "./ResultTimeline";
 import { alignNotes, rootRawText, AlignRequestError } from "./api";
+import { validateAnchors } from "./anchors";
 import {
   JsonSourceError,
   locateOffset,
@@ -9,15 +11,17 @@ import {
   type Range,
 } from "./jsonLocations";
 import { validateSequence } from "./validation";
-import type { AlignResponse, Int } from "./types";
+import type { AlignResponse, Anchor, Int } from "./types";
 
 type Side = "left" | "right";
 
 interface MarkedError {
   message: string;
-  /** full API-style path such as `left[2].time`, or "" for a global failure */
+  /** full API-style path such as `left[2].time` or `anchors[1].left` */
   path: string;
   side: Side | null;
+  /** index into the anchors array when this failure concerns an anchor */
+  anchorIndex?: number;
   /** character offset inside the offending textarea (malformed JSON) */
   offset?: number;
 }
@@ -34,9 +38,28 @@ const SAMPLE_RIGHT = `[
   {"time": 12000, "text": "交接后的补充记录"}
 ]`;
 
+/** Pull a best-effort index/time/text list out of a parsed (or bad) array. */
+function toPickerNotes(value: unknown): PickerNote[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item, index) => {
+    const obj = item && typeof item === "object" && !Array.isArray(item)
+      ? (item as Record<string, unknown>)
+      : {};
+    return { index, time: obj.time, text: obj.text };
+  });
+}
+
+/** Extract the anchor index from a path like `anchors[2].left`, else -1. */
+function anchorIndexFromPath(path: string): number {
+  const match = /^anchors\[(\d+)\]/.exec(path);
+  return match ? Number(match[1]) : -1;
+}
+
 export default function App() {
   const [leftText, setLeftText] = useState(SAMPLE_LEFT);
   const [rightText, setRightText] = useState(SAMPLE_RIGHT);
+  const [anchors, setAnchors] = useState<Anchor[]>([]);
+  const [pickError, setPickError] = useState<string | null>(null);
   const [error, setError] = useState<MarkedError | null>(null);
   const [result, setResult] = useState<AlignResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -52,6 +75,17 @@ export default function App() {
     };
     return { left: parse(leftText), right: parse(rightText) };
   }, [leftText, rightText]);
+
+  // Picker lists follow whatever currently parses; malformed items still get
+  // a row (with “—” placeholders) so their index is visible.
+  const leftNotes = useMemo(
+    () => toPickerNotes(located.left?.value),
+    [located.left],
+  );
+  const rightNotes = useMemo(
+    () => toPickerNotes(located.right?.value),
+    [located.right],
+  );
 
   /**
    * Map a relative path ("", "[200]", "[2]", "[2].time") onto the source
@@ -75,9 +109,36 @@ export default function App() {
     return rangeForRelative(side, error.path.slice(prefix.length));
   }
 
+  function addAnchor(candidate: Anchor): string | null {
+    const tentative = [...anchors, candidate];
+    // Local, single-failure check mirrors the server (range, reuse, order).
+    const issue = validateAnchors(
+      tentative,
+      leftNotes.length,
+      rightNotes.length,
+    );
+    if (issue) {
+      setPickError(issue.message);
+      return issue.message;
+    }
+    setAnchors(tentative);
+    setPickError(null);
+    setError(null);
+    setResult(null);
+    return null;
+  }
+
+  function removeAnchor(index: number) {
+    setAnchors((prev) => prev.filter((_, k) => k !== index));
+    setPickError(null);
+    setError(null);
+    setResult(null);
+  }
+
   async function handleSubmit() {
     setError(null);
     setResult(null);
+    setPickError(null);
     setLoading(true);
     try {
       // --- Phase 1: each textarea must itself parse as JSON (left first) ---
@@ -118,19 +179,48 @@ export default function App() {
         return;
       }
 
+      // --- Phase 2b: anchors must exist, never repeat and stay ordered ----
+      const m = (leftParsed.value as unknown[]).length;
+      const n = (rightParsed.value as unknown[]).length;
+      const anchorIssue = validateAnchors(anchors, m, n);
+      if (anchorIssue) {
+        setError({
+          message: anchorIssue.message,
+          path: anchorIssue.path,
+          side: null,
+          anchorIndex: anchorIssue.index >= 0 ? anchorIssue.index : undefined,
+        });
+        return;
+      }
+
       // --- Phase 3: the server performs the DP alignment ------------------
       // The raw array source is forwarded verbatim so integer literals
-      // beyond Number.MAX_SAFE_INTEGER keep their exact digits.
+      // beyond Number.MAX_SAFE_INTEGER keep their exact digits. Anchors are
+      // only sent when at least one is confirmed, keeping anchor-free
+      // requests and responses byte-for-byte identical to the legacy API.
       const leftRaw = rootRawText(leftText);
       const rightRaw = rootRawText(rightText);
+      const anchorsToSend = anchors.length > 0 ? anchors : undefined;
       try {
-        const aligned = await alignNotes(leftRaw, rightRaw);
+        const aligned = await alignNotes(leftRaw, rightRaw, fetch, anchorsToSend);
         setResult(aligned);
         setRevealed(aligned.steps.length);
       } catch (e) {
         if (e instanceof AlignRequestError && e.path) {
-          const side: Side = e.path.startsWith("right") ? "right" : "left";
-          setError({ message: e.message, path: e.path, side });
+          const anchorIndex = anchorIndexFromPath(e.path);
+          if (anchorIndex >= 0 || e.path === "anchors") {
+            // Anchor failure: keep both inputs and every selected marker,
+            // flag the single offending anchor, and show no new timeline.
+            setError({
+              message: e.message,
+              path: e.path,
+              side: null,
+              anchorIndex: anchorIndex >= 0 ? anchorIndex : undefined,
+            });
+          } else {
+            const side: Side = e.path.startsWith("right") ? "right" : "left";
+            setError({ message: e.message, path: e.path, side });
+          }
         } else if (e instanceof AlignRequestError) {
           setError({ message: e.message, path: "", side: null });
         } else {
@@ -161,6 +251,8 @@ export default function App() {
   function loadSample() {
     setLeftText(SAMPLE_LEFT);
     setRightText(SAMPLE_RIGHT);
+    setAnchors([]);
+    setPickError(null);
     setError(null);
     setResult(null);
     setRevealed(0);
@@ -169,6 +261,8 @@ export default function App() {
   function clearAll() {
     setLeftText("[]");
     setRightText("[]");
+    setAnchors([]);
+    setPickError(null);
     setError(null);
     setResult(null);
     setRevealed(0);
@@ -186,6 +280,9 @@ export default function App() {
     visibleResult && visibleResult.steps.length > 0
       ? visibleResult.steps[visibleResult.steps.length - 1].cumulative_cost
       : 0;
+
+  const flaggedAnchorIndex =
+    error && error.path.startsWith("anchors") ? error.anchorIndex ?? -1 : -1;
 
   return (
     <main className="page">
@@ -222,6 +319,16 @@ export default function App() {
           invalid={error?.side === "right"}
         />
       </section>
+
+      <AnchorPanel
+        leftNotes={leftNotes}
+        rightNotes={rightNotes}
+        anchors={anchors}
+        errorIndex={flaggedAnchorIndex}
+        pickError={pickError}
+        onAdd={addAnchor}
+        onRemove={removeAnchor}
+      />
 
       <section className="controls">
         <button

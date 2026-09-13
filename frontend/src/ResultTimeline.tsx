@@ -6,6 +6,11 @@ const ACTION_LABEL: Record<AlignStep["action"], string> = {
   right_gap: "右侧留空",
 };
 
+const ORIGIN_LABEL: Record<NonNullable<AlignStep["origin"]>, string> = {
+  anchor: "人工锚点",
+  auto: "算法生成",
+};
+
 function n(v: Int): string {
   return typeof v === "bigint" ? v.toString() : String(v);
 }
@@ -59,6 +64,12 @@ export default function ResultTimeline({
       <p className="legend" data-testid="legend">
         代价规则：相同文本配对 = 时间差绝对值；不同文本配对 = 时间差 + 3000；
         任一侧留空 = 2000。平局时优先配对，其次左侧留空，再次右侧留空。
+        {result.anchors && result.anchors.length > 0 && (
+          <span className="legend-anchors" data-testid="legend-anchors">
+            {" "}本次含 {result.anchors.length} 个人工锚点，标记为「人工锚点」的行固定入列，
+            其余行为各区间内动态规划生成，逐步复算仍汇总到同一总代价。
+          </span>
+        )}
       </p>
       <div className="summary" data-testid="summary">
         <span className="badge match">配对 {result.counts.match}</span>
@@ -84,6 +95,7 @@ export default function ResultTimeline({
               <th>左侧口译员</th>
               <th>动作</th>
               <th>右侧口译员</th>
+              <th>来源</th>
               <th>单步代价</th>
               <th>累计代价</th>
               <th>复算</th>
@@ -93,9 +105,15 @@ export default function ResultTimeline({
             {result.steps.map((step, idx) => (
               <tr
                 key={idx}
-                className={`row-${step.action}`}
+                className={[
+                  `row-${step.action}`,
+                  step.origin === "anchor" ? "row-anchor" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
                 data-testid="timeline-row"
                 data-action={step.action}
+                data-origin={step.origin ?? ""}
               >
                 <td className="idx">{idx + 1}</td>
                 <td className="note-cell">
@@ -112,6 +130,18 @@ export default function ResultTimeline({
                   <span className={`action-tag tag-${step.action}`}>
                     {ACTION_LABEL[step.action]}
                   </span>
+                </td>
+                <td className="origin-cell">
+                  {step.origin ? (
+                    <span
+                      className={`origin-tag tag-origin-${step.origin}`}
+                      data-testid="step-origin"
+                    >
+                      {ORIGIN_LABEL[step.origin]}
+                    </span>
+                  ) : (
+                    <span className="origin-tag origin-none">—</span>
+                  )}
                 </td>
                 <td className="note-cell">
                   {step.right ? (
@@ -135,7 +165,7 @@ export default function ResultTimeline({
           </tbody>
           <tfoot>
             <tr>
-              <td colSpan={4} className="total-label">
+              <td colSpan={5} className="total-label">
                 总成本最小
               </td>
               <td className="total-step">{n(sumOfStepCosts)}</td>
