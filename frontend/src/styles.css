@@ -369,6 +369,92 @@ tr.row-anchor {
   color: var(--match);
 }
 
+/* ---- Alternative (strict second-best) alignment ----------------------- */
+
+.compare-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  font-size: 14px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.compare-toggle input {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.alt-summary {
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border: 1px solid #c7d2fe;
+  border-radius: 8px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 13px;
+}
+
+.alt-summary strong {
+  font-size: 14px;
+}
+
+.alt-summary code {
+  background: #e0e7ff;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.alt-empty {
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+tr.row-divergence {
+  outline: 2px dashed #818cf8;
+  outline-offset: -2px;
+}
+
+tr.alt-row {
+  background: #f5f3ff;
+  font-size: 12.5px;
+}
+
+tr.alt-row td {
+  border-bottom: 2px solid #c7d2fe;
+  color: #4338ca;
+}
+
+.alt-flag {
+  font-weight: 700;
+  color: #4338ca !important;
+  white-space: nowrap;
+}
+
+.alt-label {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid #818cf8;
+  color: #4338ca;
+  background: #eef2ff;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.alt-gap {
+  white-space: nowrap;
+  font-weight: 600;
+}
+
 .result {
   background: var(--panel);
   border: 1px solid var(--line);

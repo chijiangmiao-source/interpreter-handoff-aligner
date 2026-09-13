@@ -4,7 +4,8 @@ The only business endpoint is ``POST /api/align`` accepting::
 
     {"left": [{"time": int, "text": str}, ...],
      "right": [{"time": int, "text": str}, ...],
-     "anchors": [{"left": int, "right": int}, ...]}   # optional
+     "anchors": [{"left": int, "right": int}, ...],   # optional
+     "compare_alternative": bool}                      # optional
 
 ``anchors`` is optional.  When present, each entry pins a human-confirmed
 pair of 0-based record indices; the service re-runs the same DP on the
@@ -12,6 +13,13 @@ intervals the anchors cut out.  Bad anchors (out of range, reused index,
 crossing/non-monotonic order) fail exactly once with a path such as
 ``anchors[1].left``.  Requests without ``anchors`` keep their historical
 behaviour and response shape exactly.
+
+``compare_alternative`` is an optional boolean (absent/false by default).
+When true the response additionally carries an ``alternative`` object with
+the strictly second-best complete path, its total cost, the cost gap and the
+note indices of the first divergence; a unique legal path yields
+``"alternative": null``.  The flag never affects the optimum: with it absent
+or false the request and response stay byte-for-byte identical to before.
 
 Malformed JSON and every structural/semantic violation (wrong type, too many
 items, missing/empty field, duplicate or non-increasing time, unknown field)
@@ -93,10 +101,25 @@ async def align_notes(request: Request) -> JSONResponse:
             return _failure(422, bad_message, bad_path)
         anchor_pairs = [(a["left"], a["right"]) for a in anchors_raw]
 
+    # Optional switch for the strictly second-best complete path.  It is
+    # examined only after the notes/anchors pass (fixed check order) and must
+    # be a plain JSON boolean; absent or false it changes nothing at all.
+    compare_alternative = False
+    if "compare_alternative" in payload:
+        flag = payload["compare_alternative"]
+        if not isinstance(flag, bool):
+            return _failure(
+                422,
+                "compare_alternative 必须是布尔值 true 或 false。",
+                "compare_alternative",
+            )
+        compare_alternative = flag
+
     result = align(
         payload["left"],
         payload["right"],
         anchors=anchor_pairs if anchors_given else None,
+        compare_alternative=compare_alternative,
     )
     return JSONResponse(result)
 

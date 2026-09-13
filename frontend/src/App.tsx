@@ -67,6 +67,10 @@ export default function App() {
   const [result, setResult] = useState<AlignResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [revealed, setRevealed] = useState(0);
+  // Optional switch for the strictly second-best complete path. It only
+  // changes what is computed alongside the optimum; it never alters the
+  // optimal timeline itself.
+  const [compareAlt, setCompareAlt] = useState(false);
   // Bumped by every input/anchor mutation. A submission captures the current
   // generation and only applies its response while no mutation has happened
   // since, so a late response never resurrects a timeline computed from
@@ -269,7 +273,13 @@ export default function App() {
       const rightRaw = rootRawText(rightText);
       const anchorsToSend = anchors.length > 0 ? anchors : undefined;
       try {
-        const aligned = await alignNotes(leftRaw, rightRaw, fetch, anchorsToSend);
+        const aligned = await alignNotes(
+          leftRaw,
+          rightRaw,
+          fetch,
+          anchorsToSend,
+          compareAlt,
+        );
         // The user edited the notes or anchors while the request was in
         // flight: this timeline was computed from superseded input, so it
         // must not reappear under the current input.
@@ -426,6 +436,20 @@ export default function App() {
         <button type="button" onClick={clearAll} data-testid="clear">
           清空为 []
         </button>
+        <label className="compare-toggle" data-testid="compare-toggle">
+          <input
+            type="checkbox"
+            data-testid="compare-alternative"
+            checked={compareAlt}
+            onChange={(e) => {
+              submitSeq.current += 1;
+              setCompareAlt(e.target.checked);
+              setError(null);
+              setResult(null);
+            }}
+          />
+          <span>比较备选对齐</span>
+        </label>
         {result && (
           <span className="replay">
             <button

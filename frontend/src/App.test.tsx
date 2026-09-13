@@ -90,6 +90,86 @@ const anchoredBody = {
   costs: { gap: 2000, mismatch_penalty: 3000 },
 };
 
+// Golden body with an equal-cost runner-up: the tail gap rows swap order.
+const compareBody = {
+  ...okBody,
+  alternative: {
+    steps: [
+      okBody.steps[0],
+      okBody.steps[1],
+      {
+        action: "left_gap",
+        left: null,
+        right: { time: 12000, text: "交接后的补充记录" },
+        cost: 2000,
+        cumulative_cost: 2250,
+      },
+      {
+        action: "right_gap",
+        left: { time: 9000, text: "感谢各位的提问" },
+        right: null,
+        cost: 2000,
+        cumulative_cost: 4250,
+      },
+    ],
+    total_cost: 4250,
+    cost_diff: 0,
+    first_divergence: { left: null, right: 2 },
+  },
+};
+
+// Strict (more expensive) runner-up: two mismatch-free matches cost 8000 vs
+// the primary gap+match+gap at 7000.
+const strictGapBody = {
+  steps: [
+    {
+      action: "right_gap",
+      left: { time: 0, text: "a" },
+      right: null,
+      cost: 2000,
+      cumulative_cost: 2000,
+    },
+    {
+      action: "match",
+      left: { time: 4000, text: "b" },
+      right: { time: 4000, text: "a" },
+      cost: 3000,
+      cumulative_cost: 5000,
+    },
+    {
+      action: "left_gap",
+      left: null,
+      right: { time: 8000, text: "b" },
+      cost: 2000,
+      cumulative_cost: 7000,
+    },
+  ],
+  total_cost: 7000,
+  counts: { match: 1, left_gap: 1, right_gap: 1 },
+  costs: { gap: 2000, mismatch_penalty: 3000 },
+  alternative: {
+    steps: [
+      {
+        action: "match",
+        left: { time: 0, text: "a" },
+        right: { time: 4000, text: "a" },
+        cost: 4000,
+        cumulative_cost: 4000,
+      },
+      {
+        action: "match",
+        left: { time: 4000, text: "b" },
+        right: { time: 8000, text: "b" },
+        cost: 4000,
+        cumulative_cost: 8000,
+      },
+    ],
+    total_cost: 8000,
+    cost_diff: 1000,
+    first_divergence: { left: 0, right: 0 },
+  },
+};
+
 describe("App", () => {
   it("renders both JSON inputs and sample data on load", () => {
     render(<App />);
@@ -586,5 +666,150 @@ describe("App", () => {
     expect(screen.queryAllByTestId("anchor-item")).toHaveLength(0);
     // Empty arrays leave no pickable records.
     expect(screen.queryByTestId("pick-left-0")).toBeNull();
+  });
+
+  // ------------------------------------------------------------------ //
+  // Strictly second-best ("compare alternative") path.
+  // ------------------------------------------------------------------ //
+
+  it("compare checkbox defaults off and adds no request field", async () => {
+    let sentBody = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sentBody = init!.body as string;
+        return new Response(JSON.stringify(okBody), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    render(<App />);
+    const toggle = screen.getByTestId("compare-alternative") as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(screen.getByTestId("submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    expect(sentBody).not.toContain("compare_alternative");
+    // Legacy response: no alternative summary and no unique-path notice.
+    expect(screen.queryByTestId("alternative-summary")).toBeNull();
+    expect(screen.queryByTestId("alternative-empty")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  it("sends compare_alternative when checked and shows the equal-cost alt", async () => {
+    let sentBody = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sentBody = init!.body as string;
+        return new Response(JSON.stringify(compareBody), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    render(<App />);
+    fireEvent.click(screen.getByTestId("compare-alternative"));
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("alternative-summary")).toBeInTheDocument(),
+    );
+    expect(sentBody).toContain('"compare_alternative":true');
+    // Primary timeline stays the 4-row body of the page.
+    expect(screen.getAllByTestId("timeline-row")).toHaveLength(4);
+    // Equal-cost runner-up: total 4250, gap 0, deterministic tie note.
+    expect(screen.getByTestId("alternative-total").textContent!.trim()).toBe("4250");
+    expect(screen.getByTestId("alternative-diff").textContent!.trim()).toBe("0");
+    expect(screen.getByTestId("alternative-summary").textContent).toContain(
+      "平局规则",
+    );
+    // First divergence: left side blank, right[2].
+    expect(screen.getByTestId("alternative-divergence").textContent).toContain(
+      "left[∅]",
+    );
+    expect(screen.getByTestId("alternative-divergence").textContent).toContain(
+      "right[2]",
+    );
+    // Exactly one expansion row, placed right after primary row #3 (idx 2),
+    // and it shows the alternative's left-gap pairing of right[2].
+    const altRows = screen.getAllByTestId("alternative-row");
+    expect(altRows).toHaveLength(1);
+    expect(altRows[0].getAttribute("data-row")).toBe("2");
+    expect(altRows[0].textContent).toContain("交接后的补充记录");
+    expect(altRows[0].textContent).toContain("成本差 +0");
+    // The primary divergence row is marked.
+    expect(screen.getAllByTestId("timeline-row")[2]).toHaveClass(
+      "row-divergence",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("shows a strictly costlier alt with the gap and first row divergence", async () => {
+    vi.stubGlobal("fetch", mockFetchOnce(strictGapBody));
+    render(<App />);
+    fireEvent.click(screen.getByTestId("compare-alternative"));
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("alternative-summary")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("alternative-total").textContent!.trim()).toBe("8000");
+    expect(screen.getByTestId("alternative-diff").textContent!.trim()).toBe("1000");
+    expect(screen.getByTestId("alternative-divergence").textContent).toContain(
+      "left[0]",
+    );
+    expect(screen.getByTestId("alternative-divergence").textContent).toContain(
+      "right[0]",
+    );
+    // Expansion under the very first primary row.
+    const altRow = screen.getByTestId("alternative-row");
+    expect(altRow.getAttribute("data-row")).toBe("0");
+    expect(altRow.textContent).toContain("成本差 +1000");
+    expect(altRow.textContent).toContain("配对");
+    vi.unstubAllGlobals();
+  });
+
+  it("shows the unique-path notice while still displaying the optimum", async () => {
+    const uniqueBody = {
+      steps: [],
+      total_cost: 0,
+      counts: { match: 0, left_gap: 0, right_gap: 0 },
+      costs: { gap: 2000, mismatch_penalty: 3000 },
+      alternative: null,
+    };
+    vi.stubGlobal("fetch", mockFetchOnce(uniqueBody));
+    render(<App />);
+    fireEvent.click(screen.getByTestId("compare-alternative"));
+    // Start from the empty-input state for a genuinely unique path.
+    fireEvent.click(screen.getByTestId("clear"));
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("alternative-empty")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("alternative-summary")).toBeNull();
+    expect(screen.queryByTestId("alternative-row")).toBeNull();
+    // The optimal (empty) result is still shown normally.
+    expect(screen.getByTestId("result-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("total-cost").textContent).toBe("0");
+    vi.unstubAllGlobals();
+  });
+
+  it("toggling the compare switch drops a stale result", async () => {
+    vi.stubGlobal("fetch", mockFetchOnce(compareBody));
+    render(<App />);
+    fireEvent.click(screen.getByTestId("compare-alternative"));
+    fireEvent.click(screen.getByTestId("submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("alternative-summary")).toBeInTheDocument(),
+    );
+    // Unchecking must not leave the old comparison on screen.
+    fireEvent.click(screen.getByTestId("compare-alternative"));
+    expect(screen.queryByTestId("result-panel")).toBeNull();
+    expect(screen.queryByTestId("alternative-summary")).toBeNull();
+    vi.unstubAllGlobals();
   });
 });

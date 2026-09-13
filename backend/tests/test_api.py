@@ -315,3 +315,184 @@ def test_cancelling_anchors_restores_free_result():
     assert anchored["total_cost"] >= free["total_cost"]
     # Re-requesting with the anchor removed returns the identical free result.
     assert post(payload).json() == free
+
+
+# --------------------------------------------------------------------------- #
+# Strictly second-best ("compare_alternative") path.
+# --------------------------------------------------------------------------- #
+
+
+def test_compare_alternative_flag_absent_or_false_is_legacy_response():
+    payload = {
+        "left": [
+            {"time": 0, "text": "a"},
+            {"time": 4000, "text": "b"},
+        ],
+        "right": [
+            {"time": 4000, "text": "a"},
+            {"time": 8000, "text": "b"},
+        ],
+    }
+    legacy = post(payload).json()
+    assert "alternative" not in legacy
+    assert post({**payload, "compare_alternative": False}).json() == legacy
+    # Anchored requests keep the same guarantee.
+    anchored_legacy = post(
+        {**payload, "anchors": [{"left": 0, "right": 0}]}
+    ).json()
+    assert "alternative" not in anchored_legacy
+    assert post(
+        {
+            **payload,
+            "anchors": [{"left": 0, "right": 0}],
+            "compare_alternative": False,
+        }
+    ).json() == anchored_legacy
+
+
+def test_compare_alternative_returns_second_path_cost_gap_and_divergence():
+    payload = {
+        "left": [
+            {"time": 0, "text": "a"},
+            {"time": 4000, "text": "b"},
+        ],
+        "right": [
+            {"time": 4000, "text": "a"},
+            {"time": 8000, "text": "b"},
+        ],
+        "compare_alternative": True,
+    }
+    data = post(payload).json()
+    # The optimum is unchanged by the flag.
+    assert data["total_cost"] == 7000
+    alt = data["alternative"]
+    assert alt["total_cost"] == 8000
+    assert alt["cost_diff"] == 1000
+    assert alt["first_divergence"] == {"left": 0, "right": 0}
+    assert [(s["action"], s["cost"]) for s in alt["steps"]] == [
+        ("match", 4000),
+        ("match", 4000),
+    ]
+    # Alternative rows carry their own cumulative costs and no provenance on
+    # an anchor-free request.
+    assert [s["cumulative_cost"] for s in alt["steps"]] == [4000, 8000]
+    assert all("origin" not in s for s in alt["steps"])
+
+
+def test_compare_alternative_equal_cost_tie_reports_zero_gap():
+    payload = {
+        "left": [
+            {"time": 0, "text": "g"},
+            {"time": 4200, "text": "p"},
+            {"time": 9000, "text": "t"},
+        ],
+        "right": [
+            {"time": 150, "text": "g"},
+            {"time": 4100, "text": "p"},
+            {"time": 12000, "text": "h"},
+        ],
+        "compare_alternative": True,
+    }
+    data = post(payload).json()
+    alt = data["alternative"]
+    assert data["total_cost"] == alt["total_cost"] == 4250
+    assert alt["cost_diff"] == 0
+    assert alt["first_divergence"] == {"left": None, "right": 2}
+    assert [s["action"] for s in alt["steps"]] == [
+        "match",
+        "match",
+        "left_gap",
+        "right_gap",
+    ]
+
+
+def test_compare_alternative_unique_path_is_null_but_result_still_shown():
+    # Empty input: exactly one (empty) legal path.
+    data = post({"left": [], "right": [], "compare_alternative": True}).json()
+    assert data["total_cost"] == 0
+    assert data["steps"] == []
+    assert data["alternative"] is None
+
+    # A single note likewise has one legal row.
+    data = post(
+        {
+            "left": [{"time": 1, "text": "a"}],
+            "right": [],
+            "compare_alternative": True,
+        }
+    ).json()
+    assert data["total_cost"] == 2000
+    assert data["alternative"] is None
+
+
+def test_compare_alternative_with_fully_pinning_anchors_is_null():
+    payload = {
+        "left": [{"time": 1, "text": "a"}],
+        "right": [{"time": 2, "text": "a"}],
+        "anchors": [{"left": 0, "right": 0}],
+        "compare_alternative": True,
+    }
+    data = post(payload).json()
+    assert data["anchors"] == [{"left": 0, "right": 0}]
+    assert data["alternative"] is None
+
+
+def test_anchors_constrain_the_alternative_path():
+    base = {
+        "left": [
+            {"time": 0, "text": "g"},
+            {"time": 4200, "text": "p"},
+            {"time": 9000, "text": "t"},
+        ],
+        "right": [
+            {"time": 150, "text": "g"},
+            {"time": 4100, "text": "p"},
+            {"time": 12000, "text": "h"},
+        ],
+    }
+    data = post(
+        {
+            **base,
+            "anchors": [{"left": 0, "right": 0}],
+            "compare_alternative": True,
+        }
+    ).json()
+    alt = data["alternative"]
+    assert alt is not None and alt["cost_diff"] == 0
+    # The forced anchor is an identical row in both timelines.
+    primary_anchor = [s for s in data["steps"] if s["origin"] == "anchor"]
+    alt_anchor = [s for s in alt["steps"] if s["origin"] == "anchor"]
+    assert primary_anchor == alt_anchor and len(alt_anchor) == 1
+    assert all(
+        s.get("origin") == "auto"
+        for s in alt["steps"]
+        if s["origin"] != "anchor"
+    )
+
+
+def test_compare_alternative_must_be_boolean():
+    for bad in ("true", 1, [True]):
+        resp = post(
+            {
+                "left": [],
+                "right": [],
+                "compare_alternative": bad,
+            }
+        )
+        assert resp.status_code == 422, (bad, resp.json())
+        body = resp.json()
+        assert body["path"] == "compare_alternative"
+        assert set(body) == {"error", "path"}
+
+
+def test_sequence_failure_is_reported_before_compare_flag_check():
+    # Fixed check order: bad notes fail before the boolean flag is examined.
+    resp = post(
+        {
+            "left": [{"time": 1, "text": ""}],
+            "right": [],
+            "compare_alternative": "yes",
+        }
+    )
+    assert resp.status_code == 422
+    assert resp.json()["path"] == "left[0].text"

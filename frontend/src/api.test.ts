@@ -120,6 +120,97 @@ describe("alignNotes", () => {
     expect(bodies[1]).toBe(`{"left":[],"right":[],"anchors":[]}`);
   });
 
+  it("omits compare_alternative unless the option is true (legacy bytes)", async () => {
+    const bodies: string[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      bodies.push(init!.body as string);
+      return jsonResponse(alignedBody);
+    });
+    const f = fetchMock as unknown as typeof fetch;
+    await alignNotes("[]", "[]", f, undefined, false);
+    expect(bodies[0]).toBe(`{"left":[],"right":[]}`);
+    expect(bodies[0]).not.toContain("compare_alternative");
+    // Default argument behaves like false.
+    await alignNotes("[]", "[]", f);
+    expect(bodies[1]).toBe(`{"left":[],"right":[]}`);
+    // With anchors + compare: both fragments, anchors first, compare last.
+    await alignNotes("[]", "[]", f, [{ left: 0, right: 0 }], true);
+    expect(bodies[2]).toBe(
+      `{"left":[],"right":[],"anchors":[{"left":0,"right":0}],"compare_alternative":true}`,
+    );
+    // Compare on without anchors.
+    await alignNotes(`[{"time":1,"text":"a"}]`, "[]", f, undefined, true);
+    expect(bodies[3]).toBe(
+      `{"left":[{"time":1,"text":"a"}],"right":[],"compare_alternative":true}`,
+    );
+  });
+
+  it("parses and normalizes the alternative payload (incl. bigint indices)", async () => {
+    const body = {
+      steps: [
+        {
+          action: "right_gap",
+          left: { time: 1, text: "a" },
+          right: null,
+          cost: 2000,
+          cumulative_cost: 2000,
+        },
+      ],
+      total_cost: 4000,
+      counts: { match: 0, left_gap: 1, right_gap: 1 },
+      costs: { gap: 2000, mismatch_penalty: 3000 },
+      alternative: {
+        steps: [
+          {
+            action: "match",
+            left: { time: 1, text: "a" },
+            right: { time: 2, text: "b" },
+            cost: 3001,
+            cumulative_cost: 3001,
+          },
+        ],
+        total_cost: 3001,
+        cost_diff: 0,
+        first_divergence: { left: 0, right: null },
+      },
+    };
+    const result = await alignNotes(
+      "[]",
+      "[]",
+      vi.fn(async () => jsonResponse(body)) as unknown as typeof fetch,
+      undefined,
+      true,
+    );
+    expect(result.alternative).not.toBeNull();
+    // Numeric literals arrive as bigint through the located parser; the
+    // divergence indices are normalized back to plain numbers (null kept).
+    expect(result.alternative!.first_divergence).toEqual({
+      left: 0,
+      right: null,
+    });
+    expect(typeof result.alternative!.first_divergence.left).toBe("number");
+    expect(result.alternative!.total_cost).toBe(3001n);
+    expect(result.alternative!.cost_diff).toBe(0n);
+  });
+
+  it("keeps a null alternative as null (unique legal path)", async () => {
+    const body = {
+      steps: [],
+      total_cost: 0,
+      counts: { match: 0, left_gap: 0, right_gap: 0 },
+      costs: { gap: 2000, mismatch_penalty: 3000 },
+      alternative: null,
+    };
+    const result = await alignNotes(
+      "[]",
+      "[]",
+      vi.fn(async () => jsonResponse(body)) as unknown as typeof fetch,
+      undefined,
+      true,
+    );
+    expect(result.alternative).toBeNull();
+  });
+
   it("returns the echoed anchors and per-row origin", async () => {
     const body = {
       steps: [

@@ -216,6 +216,165 @@ def run_anchor_checks(left, right, free_body) -> None:
     )
 
 
+def run_compare_alternative_checks(left, right, free_body) -> None:
+    """Acceptance for the strictly second-best ("alternative") path."""
+    base = {"left": left, "right": right}
+
+    # Guarantee 1: absent / false flag adds no analysis field at all, and the
+    # response is byte/structure identical to the legacy result.
+    status, body = http("POST", f"{API_URL}/api/align", {**base})
+    check(
+        "compare: flag absent keeps the exact legacy response (no alternative)",
+        status == 200 and body == free_body and "alternative" not in body,
+        f"body={body}",
+    )
+    status, body_false = http(
+        "POST", f"{API_URL}/api/align", {**base, "compare_alternative": False}
+    )
+    check(
+        "compare: compare_alternative=false equals the legacy response",
+        status == 200 and body_false == free_body,
+    )
+
+    # Guarantee 2: on the golden input an equal-cost runner-up exists (the
+    # tail gap order swap) and is selected deterministically by the ties.
+    status, body = http(
+        "POST", f"{API_URL}/api/align", {**base, "compare_alternative": True}
+    )
+    check(
+        "compare: golden optimum is unchanged while comparing",
+        status == 200
+        and body["steps"] == free_body["steps"]
+        and body["total_cost"] == free_body["total_cost"],
+        f"body={body}",
+    )
+    alt = body.get("alternative")
+    check(
+        "compare: golden equal-cost alternative (diff 0, first divergence)",
+        alt is not None
+        and alt["total_cost"] == 4250
+        and alt["cost_diff"] == 0
+        and alt["first_divergence"] == {"left": None, "right": 2}
+        and [s["action"] for s in alt["steps"]]
+        == ["match", "match", "left_gap", "right_gap"]
+        and sum(s["cost"] for s in alt["steps"]) == alt["total_cost"]
+        and [s["cumulative_cost"] for s in alt["steps"]]
+        == [150, 250, 2250, 4250],
+        f"alt={alt}",
+    )
+
+    # Guarantee 3: a strictly costlier runner-up reports the positive gap and
+    # the note indices at the first disagreement.
+    strict = {
+        "left": [
+            {"time": 0, "text": "a"},
+            {"time": 4000, "text": "b"},
+        ],
+        "right": [
+            {"time": 4000, "text": "a"},
+            {"time": 8000, "text": "b"},
+        ],
+    }
+    status, body = http(
+        "POST", f"{API_URL}/api/align", {**strict, "compare_alternative": True}
+    )
+    alt = body.get("alternative")
+    check(
+        "compare: strict runner-up cost/gap/divergence and deterministic order",
+        status == 200
+        and body["total_cost"] == 7000
+        and alt is not None
+        and alt["total_cost"] == 8000
+        and alt["cost_diff"] == 1000
+        and alt["first_divergence"] == {"left": 0, "right": 0}
+        and [s["action"] for s in alt["steps"]] == ["match", "match"],
+        f"body={body}",
+    )
+    _, again = http(
+        "POST", f"{API_URL}/api/align", {**strict, "compare_alternative": True}
+    )
+    check(
+        "compare: alternative is selected deterministically",
+        again["alternative"] == alt,
+    )
+
+    # Guarantee 4: a unique legal path (empty input, or fully pinning anchors)
+    # yields null but the optimal result is still returned normally.
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {"left": [], "right": [], "compare_alternative": True},
+    )
+    check(
+        "compare: empty unique path returns null alternative with the result",
+        status == 200
+        and body["steps"] == []
+        and body["total_cost"] == 0
+        and body["alternative"] is None,
+        f"body={body}",
+    )
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            "left": [{"time": 1, "text": "a"}],
+            "right": [{"time": 2, "text": "a"}],
+            "anchors": [{"left": 0, "right": 0}],
+            "compare_alternative": True,
+        },
+    )
+    check(
+        "compare: fully pinning anchors make the path unique (null)",
+        status == 200
+        and body["anchors"] == [{"left": 0, "right": 0}]
+        and body["alternative"] is None,
+        f"body={body}",
+    )
+
+    # Guarantee 5: anchors constrain the alternative path as well — the forced
+    # anchor row is present identically in both timelines.
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            **base,
+            "anchors": [{"left": 0, "right": 0}],
+            "compare_alternative": True,
+        },
+    )
+    primary_anchor = [s for s in body["steps"] if s.get("origin") == "anchor"]
+    alt_anchor = [
+        s for s in body["alternative"]["steps"] if s.get("origin") == "anchor"
+    ]
+    check(
+        "compare: anchors pin the alternative path identically",
+        status == 200
+        and body["alternative"] is not None
+        and alt_anchor == primary_anchor
+        and len(alt_anchor) == 1
+        and all(
+            s.get("origin") == "auto"
+            for s in body["alternative"]["steps"]
+            if s.get("origin") != "anchor"
+        ),
+        f"body={body}",
+    )
+
+    # The flag must be a plain boolean; the single-failure contract holds.
+    status, body = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {"left": [], "right": [], "compare_alternative": "yes"},
+    )
+    check(
+        "compare: non-boolean flag fails once at compare_alternative",
+        status == 422
+        and set(body) == {"error", "path"}
+        and body["path"] == "compare_alternative",
+        f"body={body}",
+    )
+
+
 def main() -> int:
     # 1. API health
     status, body = http("GET", f"{API_URL}/health")
@@ -476,6 +635,9 @@ def main() -> int:
 
     # 8. Human-confirmed anchors.
     run_anchor_checks(left, right, first)
+
+    # 9. Strictly second-best alternative path comparison.
+    run_compare_alternative_checks(left, right, first)
 
     print(f"\n{checks - len(failures)}/{checks} checks passed.")
     if failures:

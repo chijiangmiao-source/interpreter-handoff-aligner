@@ -1,4 +1,5 @@
-import type { AlignResponse, AlignStep, Int } from "./types";
+import { Fragment } from "react";
+import type { AlignResponse, AlignStep, AlternativeAlignment, Int } from "./types";
 
 const ACTION_LABEL: Record<AlignStep["action"], string> = {
   match: "配对",
@@ -26,6 +27,24 @@ function absDiff(a: Int, b: Int): string {
 
 function fmtTime(t: Int | null | undefined): string {
   return t === null || t === undefined ? "—" : `${n(t)} ms`;
+}
+
+/** Content identity of a row, to locate where the two timelines split. */
+function stepKey(step: AlignStep): string {
+  const l = step.left ? `${step.left.time}|${step.left.text}` : "∅";
+  const r = step.right ? `${step.right.time}|${step.right.text}` : "∅";
+  return `${step.action}|${l}|${r}`;
+}
+
+/** First primary row whose pairing differs from the alternative path (-1 never). */
+function divergenceRowIndex(
+  primary: AlignStep[],
+  alternative: AlternativeAlignment,
+): number {
+  for (let k = 0; k < primary.length && k < alternative.steps.length; k++) {
+    if (stepKey(primary[k]) !== stepKey(alternative.steps[k])) return k;
+  }
+  return -1;
 }
 
 /** Human-readable recomputation of the single-step cost, row by row. */
@@ -58,6 +77,16 @@ export default function ResultTimeline({
     0,
   );
 
+  // `compare_alternative: true` responses carry the field as an object (an
+  // alternative exists) or null (unique legal path); absent means the flag
+  // was off and the legacy response deliberately says nothing about it.
+  const compareRequested = "alternative" in result;
+  const alternative = result.alternative ?? null;
+  const divergence = alternative
+    ? divergenceRowIndex(result.steps, alternative)
+    : -1;
+  const divergenceVisible = divergence >= 0 && divergence < result.steps.length;
+
   return (
     <section className="result" data-testid="result-panel">
       <h2>唯一最优时间轴</h2>
@@ -87,6 +116,32 @@ export default function ResultTimeline({
         </span>
       </div>
 
+      {compareRequested && alternative && (
+        <p className="alt-summary" data-testid="alternative-summary">
+          已按同一代价与平局规则选出严格次优完整路径：备选总代价
+          <strong data-testid="alternative-total"> {n(alternative.total_cost)}</strong>
+          ，与最优路径的成本差
+          <strong data-testid="alternative-diff"> {n(alternative.cost_diff)}</strong>
+          {n(alternative.cost_diff) === "0"
+            ? "（同代价，按平局规则确定顺序）"
+            : ""}
+          ；双方首处分歧涉及笔记索引
+          <code data-testid="alternative-divergence">
+            {" "}left[{alternative.first_divergence.left ?? "∅"}] ↔
+            right[{alternative.first_divergence.right ?? "∅"}]
+          </code>
+          {divergenceVisible
+            ? "，备选配对已在该分歧行旁展开。"
+            : "（逐步复算展开到该分歧行时显示备选配对）。"}
+        </p>
+      )}
+      {compareRequested && !alternative && (
+        <p className="alt-empty" data-testid="alternative-empty">
+          当前锚点约束（或空输入）下合法路径唯一，不存在代价接近但配对方式不同的
+          备选路径；上方即为唯一最优时间轴。
+        </p>
+      )}
+
       <div className="table-scroll">
         <table className="timeline">
           <thead>
@@ -103,64 +158,69 @@ export default function ResultTimeline({
           </thead>
           <tbody>
             {result.steps.map((step, idx) => (
-              <tr
-                key={idx}
-                className={[
-                  `row-${step.action}`,
-                  step.origin === "anchor" ? "row-anchor" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-                data-testid="timeline-row"
-                data-action={step.action}
-                data-origin={step.origin ?? ""}
-              >
-                <td className="idx">{idx + 1}</td>
-                <td className="note-cell">
-                  {step.left ? (
-                    <>
-                      <span className="time">{fmtTime(step.left.time)}</span>
-                      <span className="text">{step.left.text}</span>
-                    </>
-                  ) : (
-                    <span className="empty">∅</span>
-                  )}
-                </td>
-                <td className="action-cell">
-                  <span className={`action-tag tag-${step.action}`}>
-                    {ACTION_LABEL[step.action]}
-                  </span>
-                </td>
-                <td className="note-cell">
-                  {step.right ? (
-                    <>
-                      <span className="time">{fmtTime(step.right.time)}</span>
-                      <span className="text">{step.right.text}</span>
-                    </>
-                  ) : (
-                    <span className="empty">∅</span>
-                  )}
-                </td>
-                <td className="origin-cell">
-                  {step.origin ? (
-                    <span
-                      className={`origin-tag tag-origin-${step.origin}`}
-                      data-testid="step-origin"
-                    >
-                      {ORIGIN_LABEL[step.origin]}
+              <Fragment key={idx}>
+                <tr
+                  className={[
+                    `row-${step.action}`,
+                    step.origin === "anchor" ? "row-anchor" : "",
+                    divergenceVisible && idx === divergence ? "row-divergence" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  data-testid="timeline-row"
+                  data-action={step.action}
+                  data-origin={step.origin ?? ""}
+                >
+                  <td className="idx">{idx + 1}</td>
+                  <td className="note-cell">
+                    {step.left ? (
+                      <>
+                        <span className="time">{fmtTime(step.left.time)}</span>
+                        <span className="text">{step.left.text}</span>
+                      </>
+                    ) : (
+                      <span className="empty">∅</span>
+                    )}
+                  </td>
+                  <td className="action-cell">
+                    <span className={`action-tag tag-${step.action}`}>
+                      {ACTION_LABEL[step.action]}
                     </span>
-                  ) : (
-                    <span className="origin-tag origin-none">—</span>
-                  )}
-                </td>
-                <td className="cost" data-testid="step-cost">
-                  {n(step.cost)}
-                </td>
-                <td className="cumulative" data-testid="step-cumulative">
-                  {n(step.cumulative_cost)}
-                </td>
-                <td className="explain">{costExplanation(step)}</td>
-              </tr>
+                  </td>
+                  <td className="note-cell">
+                    {step.right ? (
+                      <>
+                        <span className="time">{fmtTime(step.right.time)}</span>
+                        <span className="text">{step.right.text}</span>
+                      </>
+                    ) : (
+                      <span className="empty">∅</span>
+                    )}
+                  </td>
+                  <td className="origin-cell">
+                    {step.origin ? (
+                      <span
+                        className={`origin-tag tag-origin-${step.origin}`}
+                        data-testid="step-origin"
+                      >
+                        {ORIGIN_LABEL[step.origin]}
+                      </span>
+                    ) : (
+                      <span className="origin-tag origin-none">—</span>
+                    )}
+                  </td>
+                  <td className="cost" data-testid="step-cost">
+                    {n(step.cost)}
+                  </td>
+                  <td className="cumulative" data-testid="step-cumulative">
+                    {n(step.cumulative_cost)}
+                  </td>
+                  <td className="explain">{costExplanation(step)}</td>
+                </tr>
+                {divergenceVisible && idx === divergence && (
+                  <AlternativeRow alternative={alternative!} index={idx} />
+                )}
+              </Fragment>
             ))}
           </tbody>
           <tfoot>
@@ -178,5 +238,65 @@ export default function ResultTimeline({
         </table>
       </div>
     </section>
+  );
+}
+
+/**
+ * The single expansion row shown directly under the primary row where the
+ * two timelines first diverge. It carries the alternative's pairing at that
+ * row plus the cost gap; the rest of the runner-up timeline stays out of
+ * the way so the primary timeline remains the focus.
+ */
+function AlternativeRow({
+  alternative,
+  index,
+}: {
+  alternative: AlternativeAlignment;
+  index: number;
+}) {
+  const step = alternative.steps[index];
+  return (
+    <tr className="alt-row" data-testid="alternative-row" data-row={index}>
+      <td className="idx alt-flag">
+        备选
+      </td>
+      <td className="note-cell alt-cell">
+        {step.left ? (
+          <>
+            <span className="time">{fmtTime(step.left.time)}</span>
+            <span className="text">{step.left.text}</span>
+          </>
+        ) : (
+          <span className="empty">∅</span>
+        )}
+      </td>
+      <td className="action-cell alt-cell">
+        <span className={`action-tag tag-${step.action}`}>
+          {ACTION_LABEL[step.action]}
+        </span>
+      </td>
+      <td className="note-cell alt-cell">
+        {step.right ? (
+          <>
+            <span className="time">{fmtTime(step.right.time)}</span>
+            <span className="text">{step.right.text}</span>
+          </>
+        ) : (
+          <span className="empty">∅</span>
+        )}
+      </td>
+      <td className="origin-cell alt-cell" colSpan={1}>
+        <span className="alt-label">严格次优</span>
+      </td>
+      <td className="cost alt-cell" data-testid="alternative-step-cost">
+        {n(step.cost)}
+      </td>
+      <td className="cumulative alt-cell" colSpan={2}>
+        <span className="alt-gap" data-testid="alternative-row-gap">
+          备选总代价 {n(alternative.total_cost)} · 成本差 +
+          {n(alternative.cost_diff)}
+        </span>
+      </td>
+    </tr>
   );
 }

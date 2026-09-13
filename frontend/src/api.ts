@@ -33,6 +33,9 @@ export function rootRawText(text: string): string {
  * - `anchors` are optional human-confirmed pairs of 0-based record indices;
  *   they are ordinary small integers, so safe to serialize with the normal
  *   JSON serializer (unlike the raw, possibly huge-integer array text);
+ * - `compareAlternative` adds `compare_alternative: true`, asking the server
+ *   for the strictly second-best complete path; it is omitted entirely when
+ *   false/undefined, keeping the legacy request byte-for-byte identical;
  * - network/non-JSON-HTTP failures become a single AlignRequestError with an
  *   empty path;
  * - API 4xx failures become AlignRequestError carrying exactly one error path
@@ -47,12 +50,17 @@ export async function alignNotes(
   rightRawArray: string,
   fetchImpl: typeof fetch = fetch,
   anchors?: Anchor[],
+  compareAlternative = false,
 ): Promise<AlignResponse> {
   // Anchors are omitted entirely for a legacy request; when present (even an
-  // empty list) they are spliced in after the raw arrays.
+  // empty list) they are spliced in after the raw arrays. The comparison
+  // flag is only sent when switched on, so false/undefined adds no bytes.
   const anchorsFragment =
     anchors === undefined ? "" : `,"anchors":${JSON.stringify(anchors)}`;
-  const body = `{"left":${leftRawArray},"right":${rightRawArray}${anchorsFragment}}`;
+  const compareFragment = compareAlternative
+    ? ',"compare_alternative":true'
+    : "";
+  const body = `{"left":${leftRawArray},"right":${rightRawArray}${anchorsFragment}${compareFragment}}`;
 
   let resp: Response;
   try {
@@ -100,6 +108,15 @@ export async function alignNotes(
       left: Number(a.left),
       right: Number(a.right),
     }));
+  }
+  // Same for the alternative's first-divergence note indices (null on the
+  // side the alternative leaves blank at that row).
+  if (result.alternative) {
+    const d = result.alternative.first_divergence;
+    result.alternative.first_divergence = {
+      left: d.left === null ? null : Number(d.left),
+      right: d.right === null ? null : Number(d.right),
+    };
   }
   return result;
 }

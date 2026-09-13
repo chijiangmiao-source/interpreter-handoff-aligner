@@ -36,9 +36,29 @@ is the sum of the per-segment optima plus the anchor costs.
 Anchors must already be validated (``app.validation.validate_anchors``):
 in-range, never reused and strictly monotonic on both sides (no crossing).
 
-When no anchors are supplied the response is exactly the historical shape
-(no ``origin``/``anchors`` fields), so old clients stay byte-for-byte
-compatible.
+When ``compare_alternative`` is true the response additionally carries an
+``alternative`` object describing the strictly second-best *complete* path
+under exactly the same costs and tie rules (``None`` when the legal path is
+unique, which empty input or a fully pinning anchor set can force).
+
+Complete paths are totally ordered first by total cost.  Two equal-cost
+paths are compared at their LAST differing step — the grid cell where they
+rejoin while tracing back is precisely the cell at which the forward DP
+resolves the tie — preferring match, then left gap, then right gap.  An
+action sequence determines a path uniquely, so this is a strict total order.
+The runner-up is found with a 2-best DP: each cell keeps the two cheapest
+distinct prefixes under that order (merging at most the two best prefixes of
+each of its three predecessors), which is enough because a global runner-up
+can only ever use a predecessor's best or second-best prefix.  With anchors
+the grid segments chain through the forced matches, so the anchors constrain
+both paths identically; the global runner-up downgrades exactly one segment
+to its own second-best (smallest extra cost, earliest segment on a tie).
+
+When the flag is false/absent no analysis field is added and the response is
+byte-for-byte the historical shape.
+
+When no anchors are supplied the response carries no ``origin``/``anchors``
+fields either, so old clients stay byte-for-byte compatible.
 
 No third-party matching/alignment library is used: this is plain DP over an
 ``(m+1) x (n+1)`` cost matrix with O(m*n) time and memory (m, n <= 200).
@@ -82,6 +102,33 @@ def _candidate_rank(total: int, action: str, pi: int, pj: int) -> tuple:
     gap), and finally the lexicographically smaller predecessor coordinate.
     """
     return (total, ACTION_PRIORITY[action], pi, pj)
+
+
+def _make_step(
+    action: str,
+    left_item: dict[str, Any] | None,
+    right_item: dict[str, Any] | None,
+    cost: int,
+    origin: str | None = None,
+) -> dict[str, Any]:
+    """Build one serializable timeline row (note copies, no index leakage)."""
+    step: dict[str, Any] = {
+        "action": action,
+        "left": (
+            None
+            if left_item is None
+            else {"time": left_item["time"], "text": left_item["text"]}
+        ),
+        "right": (
+            None
+            if right_item is None
+            else {"time": right_item["time"], "text": right_item["text"]}
+        ),
+        "cost": cost,
+    }
+    if origin is not None:
+        step["origin"] = origin
+    return step
 
 
 def _fill_dp(
@@ -144,7 +191,7 @@ def _trace_segment(
 
     The entry corner is not emitted (it is the start cell or a forced anchor
     owned by the caller).  Steps are returned in reverse (traceback) order and
-    tagged ``auto``; anchor rows are added by :func:`align`.
+    tagged ``auto``; anchor rows are added by :func:`_compute_primary`.
     """
     out: list[dict[str, Any]] = []
     i, j = i1, j1
@@ -153,50 +200,62 @@ def _trace_segment(
         if action == ACTION_MATCH:
             l, r = left[i - 1], right[j - 1]
             out.append(
-                {
-                    "action": ACTION_MATCH,
-                    "left": {"time": l["time"], "text": l["text"]},
-                    "right": {"time": r["time"], "text": r["text"]},
-                    "cost": match_cost(l, r),
-                    "origin": ORIGIN_AUTO,
-                }
+                _make_step(
+                    ACTION_MATCH, l, r, match_cost(l, r), origin=ORIGIN_AUTO
+                )
             )
             i, j = i - 1, j - 1
         elif action == ACTION_LEFT_GAP:
             # Left side blank: the row carries the right-side note.
-            r = right[j - 1]
             out.append(
-                {
-                    "action": ACTION_LEFT_GAP,
-                    "left": None,
-                    "right": {"time": r["time"], "text": r["text"]},
-                    "cost": GAP_COST,
-                    "origin": ORIGIN_AUTO,
-                }
+                _make_step(
+                    ACTION_LEFT_GAP,
+                    None,
+                    right[j - 1],
+                    GAP_COST,
+                    origin=ORIGIN_AUTO,
+                )
             )
             j -= 1
         else:  # ACTION_RIGHT_GAP — right side blank, row carries left note
-            l = left[i - 1]
             out.append(
-                {
-                    "action": ACTION_RIGHT_GAP,
-                    "left": {"time": l["time"], "text": l["text"]},
-                    "right": None,
-                    "cost": GAP_COST,
-                    "origin": ORIGIN_AUTO,
-                }
+                _make_step(
+                    ACTION_RIGHT_GAP,
+                    left[i - 1],
+                    None,
+                    GAP_COST,
+                    origin=ORIGIN_AUTO,
+                )
             )
             i -= 1
     return out
 
 
-def align(
+def _segments(
+    m: int, n: int, anchor_pairs: list[tuple[int, int]]
+) -> list[tuple[int, int, int, int, tuple[int, int] | None]]:
+    """Cut the grid into (entry corner, exit corner, forced anchor) pieces.
+
+    The forced anchor ``(a, b)`` (when not None) is the diagonal edge taken
+    immediately after reaching the exit corner; the next segment's entry is
+    ``(a + 1, b + 1)``.  The trailing segment has no forced anchor.
+    """
+    pieces: list[tuple[int, int, int, int, tuple[int, int] | None]] = []
+    i0 = j0 = 0
+    for ai, aj in anchor_pairs:
+        pieces.append((i0, j0, ai, aj, (ai, aj)))
+        i0, j0 = ai + 1, aj + 1
+    pieces.append((i0, j0, m, n, None))
+    return pieces
+
+
+def _compute_primary(
     left: list[dict[str, Any]],
     right: list[dict[str, Any]],
-    anchors: list[tuple[int, int]] | None = None,
+    anchor_pairs: list[tuple[int, int]],
 ) -> dict[str, Any]:
+    """The unique, tie-broken minimum-cost timeline (the existing DP)."""
     m, n = len(left), len(right)
-    anchor_pairs: list[tuple[int, int]] = list(anchors or [])
 
     # dp[i][j] = minimum total cost aligning the first i left / j right notes.
     dp: list[list[int]] = [[0] * (n + 1) for _ in range(m + 1)]
@@ -221,13 +280,9 @@ def align(
         l, r = left[ai], right[aj]
         anchor_cost = match_cost(l, r)
         steps.append(
-            {
-                "action": ACTION_MATCH,
-                "left": {"time": l["time"], "text": l["text"]},
-                "right": {"time": r["time"], "text": r["text"]},
-                "cost": anchor_cost,
-                "origin": ORIGIN_ANCHOR,
-            }
+            _make_step(
+                ACTION_MATCH, l, r, anchor_cost, origin=ORIGIN_ANCHOR
+            )
         )
 
         # 3) Seed the next segment's entry corner with the accumulated cost.
@@ -238,6 +293,13 @@ def align(
     _fill_dp(left, right, i0, j0, m, n, dp, chosen)
     steps.extend(reversed(_trace_segment(left, right, i0, j0, m, n, chosen)))
 
+    return _finalize(steps, anchor_pairs)
+
+
+def _finalize(
+    steps: list[dict[str, Any]], anchor_pairs: list[tuple[int, int]]
+) -> dict[str, Any]:
+    """Attach cumulative costs and wrap the rows in the response object."""
     # Cumulative cost lets the UI replay the computation row by row.
     cumulative = 0
     for step in steps:
@@ -266,5 +328,349 @@ def align(
         # Historical contract: an unanchored response carries no extra fields.
         for step in steps:
             step.pop("origin", None)
+
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Strictly second-best ("alternative") complete path: a two-best DP.
+# --------------------------------------------------------------------------- #
+#
+# Every prefix ending at grid cell (i, j) has exactly i+j steps (each move
+# advances i+j by one), so prefixes of one cell only differ in content, never
+# in length.  They are ordered as the complete paths are:
+#
+#   1. smaller total cost;
+#   2. equal cost -> compare the codes of their LAST differing step, walking
+#      backward from the cell, preferring match (1), then left gap (2), then
+#      right gap (3).  Equal action sequences at one cell are the same path,
+#      so distinct prefixes always differ somewhere.
+#
+# Each cell keeps only its best two prefixes: a path ranked third or worse at
+# a predecessor can never become the global runner-up after one more edge,
+# because the predecessor's better prefixes extend through that same edge.
+# Merging at most two prefixes from each of the three predecessors (six
+# candidates) therefore preserves exactly the best two prefixes at every
+# cell.  With anchors the same fill runs per segment and the forced matches
+# chain the segments; the global runner-up downgrades exactly one segment to
+# its own second-best prefix.
+
+# A prefix is (total_cost, action_code, prev_prefix, step_row).  Action code
+# 0 only marks a segment's empty entry prefix, where the backward walk stops.
+_PREFIX_EMPTY_CODE = 0
+
+# Backward-walk action preference at an equal-cost rejoin cell: match first,
+# then left gap, then right gap — the forward DP tie-break, applied at the
+# last differing step.
+_ACTION_CODE = {
+    ACTION_MATCH: 1,
+    ACTION_LEFT_GAP: 2,
+    ACTION_RIGHT_GAP: 3,
+}
+
+
+def _prefix_less(a: tuple, b: tuple, sentinel: tuple) -> bool:
+    """Order two prefixes ending at the same cell of one segment.
+
+    Total cost first; on a tie the last differing step decides (its action
+    code), exactly the forward DP's tie-break at the cell where the paths
+    rejoin.  The backward walk is short in practice (the final actions
+    usually differ) and never longer than the path (m + n <= 400).
+    """
+    if a[0] != b[0]:
+        return a[0] < b[0]
+    pa, pb = a, b
+    while pa is not sentinel and pb is not sentinel:
+        if pa[1] != pb[1]:
+            return pa[1] < pb[1]
+        pa, pb = pa[2], pb[2]
+    return False  # identical action sequence at one cell == the same prefix
+
+
+class _CmpPrefix:
+    """Sort key wrapper so ``sorted`` can use :func:`_prefix_less`."""
+
+    __slots__ = ("value", "sentinel")
+
+    def __init__(self, value: tuple, sentinel: tuple):
+        self.value = value
+        self.sentinel = sentinel
+
+    def __lt__(self, other: "_CmpPrefix") -> bool:
+        return _prefix_less(self.value, other.value, self.sentinel)
+
+
+def _edge_step(
+    action: str,
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+    i: int,
+    j: int,
+    anchored: bool,
+) -> dict[str, Any]:
+    """The row added by ``action`` arriving at local cell (i, j)."""
+    origin = ORIGIN_AUTO if anchored else None
+    if action == ACTION_MATCH:
+        return _make_step(
+            ACTION_MATCH, left[i - 1], right[j - 1],
+            match_cost(left[i - 1], right[j - 1]), origin=origin,
+        )
+    if action == ACTION_LEFT_GAP:
+        return _make_step(
+            ACTION_LEFT_GAP, None, right[j - 1], GAP_COST, origin=origin
+        )
+    return _make_step(
+        ACTION_RIGHT_GAP, left[i - 1], None, GAP_COST, origin=origin
+    )
+
+
+def _fill_segment_two_best(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+    i0: int,
+    j0: int,
+    i1: int,
+    j1: int,
+    base_cost: int,
+    anchored: bool,
+) -> tuple[list[list[tuple | None]], tuple]:
+    """Best two prefixes for every cell in one anchor-bounded rectangle.
+
+    ``base_cost`` is the absolute cost already paid on the forced best chain
+    before this segment's entry corner.  Returns the local table and the
+    segment's entry sentinel; ``table[u][v]`` holds
+    ``(best_prefix, second_prefix_or_None)`` in local coordinates
+    (``u = i - i0``, ``v = j - j0``).
+    """
+    h, w = i1 - i0, j1 - j0
+    sentinel = (base_cost, _PREFIX_EMPTY_CODE, None, None)
+    table: list[list[tuple | None]] = [
+        [None] * (w + 1) for _ in range(h + 1)
+    ]
+    table[0][0] = (sentinel, None)
+
+    def keep(u: int, v: int, candidates: list[tuple]) -> None:
+        # Distinct (predecessor, edge) pairs never describe the same path
+        # (each action has a unique predecessor cell, and one predecessor's
+        # two stored prefixes are distinct), so object identity is enough:
+        # sort the candidates and retain the leading two.
+        ranked = sorted(
+            candidates,
+            key=lambda p: _CmpPrefix(p, sentinel),
+        )
+        table[u][v] = (
+            ranked[0],
+            ranked[1] if len(ranked) > 1 else None,
+        )
+
+    # Borders: a single edge kind is legal there, as in _fill_dp.
+    for u in range(1, h + 1):
+        pred = table[u - 1][0][0]
+        i = i0 + u
+        step = _edge_step(ACTION_RIGHT_GAP, left, right, i, j0, anchored)
+        keep(u, 0, [(pred[0] + GAP_COST,
+                     _ACTION_CODE[ACTION_RIGHT_GAP], pred, step)])
+    for v in range(1, w + 1):
+        pred = table[0][v - 1][0]
+        j = j0 + v
+        step = _edge_step(ACTION_LEFT_GAP, left, right, i0, j, anchored)
+        keep(0, v, [(pred[0] + GAP_COST,
+                     _ACTION_CODE[ACTION_LEFT_GAP], pred, step)])
+
+    for u in range(1, h + 1):
+        i = i0 + u
+        for v in range(1, w + 1):
+            j = j0 + v
+            candidates: list[tuple] = []
+            diag_best, diag_second = table[u - 1][v - 1]
+            up_best, up_second = table[u - 1][v]      # -> right_gap edge
+            left_best, left_second = table[u][v - 1]  # -> left_gap edge
+
+            mc = match_cost(left[i - 1], right[j - 1])
+            for pred in (diag_best, diag_second):
+                if pred is not None:
+                    candidates.append(
+                        (pred[0] + mc,
+                         _ACTION_CODE[ACTION_MATCH], pred,
+                         _edge_step(ACTION_MATCH, left, right, i, j, anchored))
+                    )
+            for pred in (up_best, up_second):
+                if pred is not None:
+                    candidates.append(
+                        (pred[0] + GAP_COST,
+                         _ACTION_CODE[ACTION_RIGHT_GAP], pred,
+                         _edge_step(ACTION_RIGHT_GAP, left, right, i, j, anchored))
+                    )
+            for pred in (left_best, left_second):
+                if pred is not None:
+                    candidates.append(
+                        (pred[0] + GAP_COST,
+                         _ACTION_CODE[ACTION_LEFT_GAP], pred,
+                         _edge_step(ACTION_LEFT_GAP, left, right, i, j, anchored))
+                    )
+            keep(u, v, candidates)
+
+    return table, sentinel
+
+
+def _trace_ref(ref: tuple, sentinel: tuple) -> list[dict[str, Any]]:
+    """Recover a segment's forward-chronological rows from a prefix ref."""
+    rows: list[dict[str, Any]] = []
+    p = ref
+    while p is not sentinel:
+        rows.append(p[3])
+        p = p[2]
+    rows.reverse()
+    return rows
+
+
+def _step_signature(step: dict[str, Any]) -> tuple:
+    """Content identity used to locate the first differing row."""
+    def note_key(item: dict[str, Any] | None) -> tuple[Any, Any] | None:
+        return None if item is None else (item["time"], item["text"])
+
+    return (
+        step["action"],
+        note_key(step["left"]),
+        note_key(step["right"]),
+        step["cost"],
+    )
+
+
+def _find_alternative(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+    anchor_pairs: list[tuple[int, int]],
+    primary_steps: list[dict[str, Any]],
+    primary_total: int,
+) -> dict[str, Any] | None:
+    """The strictly second-ranked distinct complete path, or None.
+
+    Each segment contributes a best and (sometimes) second-best prefix.  The
+    global runner-up keeps every segment at its best except exactly one,
+    downgraded to its second-best; the downgrade with the smallest extra
+    cost wins (the earliest such segment on a tie, since then the last
+    differing step is resolved in that segment's favour).  Forced anchors
+    are identical rows in both paths and simply chain the segments.
+    """
+    m, n = len(left), len(right)
+    anchored = bool(anchor_pairs)
+    pieces = _segments(m, n, anchor_pairs)
+
+    # Per segment: exit refs (best, second), the entry sentinel, and the
+    # forced anchor following the segment (if any).
+    exits: list[tuple[tuple, tuple | None]] = []
+    sentinels: list[tuple] = []
+    base = 0
+    for i0, j0, i1, j1, _forced in pieces:
+        table, sentinel = _fill_segment_two_best(
+            left, right, i0, j0, i1, j1, base, anchored
+        )
+        best_ref, second_ref = table[i1 - i0][j1 - j0]
+        exits.append((best_ref, second_ref))
+        sentinels.append(sentinel)
+        if (i1, j1) != (m, n):
+            # Forced anchor edge seeds the next segment's entry cost.
+            base = best_ref[0] + match_cost(left[i1], right[j1])
+
+    # Sanity: the chained segment bests are exactly the DP primary total.
+    if exits[-1][0][0] != primary_total:
+        raise RuntimeError("two-best DP disagrees with the primary DP cost")
+
+    # Smallest downgrade cost, earliest segment first on a tie.
+    downgrades = [
+        (second[0] - best[0], k)
+        for k, (best, second) in enumerate(exits)
+        if second is not None
+    ]
+    if not downgrades:
+        return None
+    extra, alt_segment = min(downgrades)
+
+    # Assemble the alternative forward rows: segment bests everywhere except
+    # the chosen segment's second-best, with the identical anchors between.
+    alt_steps: list[dict[str, Any]] = []
+    for k, (i0, j0, i1, j1, forced) in enumerate(pieces):
+        best_ref, second_ref = exits[k]
+        ref = second_ref if k == alt_segment else best_ref
+        alt_steps.extend(_trace_ref(ref, sentinels[k]))
+        if forced is not None:
+            ai, aj = forced
+            l, r = left[ai], right[aj]
+            alt_steps.append(
+                _make_step(
+                    ACTION_MATCH, l, r, match_cost(l, r),
+                    origin=ORIGIN_ANCHOR,
+                )
+            )
+
+    if not anchored:
+        for step in alt_steps:
+            step.pop("origin", None)
+
+    total = sum(s["cost"] for s in alt_steps)
+    if total != primary_total + extra:
+        raise RuntimeError("alternative cost does not match its downgrade")
+
+    cumulative = 0
+    for step in alt_steps:
+        cumulative += step["cost"]
+        step["cumulative_cost"] = cumulative
+
+    # First row (forward order) at which the two timelines differ; its index
+    # pair is how many notes each side consumed during the shared prefix,
+    # with a null side when the alternative's row leaves that side blank.
+    primary_sigs = [_step_signature(s) for s in primary_steps]
+    alt_sigs = [_step_signature(s) for s in alt_steps]
+    d = 0
+    while (
+        d < len(primary_sigs)
+        and d < len(alt_sigs)
+        and primary_sigs[d] == alt_sigs[d]
+    ):
+        d += 1
+
+    if d >= len(alt_sigs) or d >= len(primary_sigs):
+        # Defensive: distinct complete paths must differ before either ends.
+        raise RuntimeError("alternative has no first divergence")
+
+    left_consumed = sum(
+        1 for s in primary_steps[:d] if s["left"] is not None
+    )
+    right_consumed = sum(
+        1 for s in primary_steps[:d] if s["right"] is not None
+    )
+    alt_row = alt_steps[d]
+    first_divergence = {
+        "left": left_consumed if alt_row["left"] is not None else None,
+        "right": right_consumed if alt_row["right"] is not None else None,
+    }
+
+    return {
+        "total_cost": total,
+        "cost_diff": extra,
+        "first_divergence": first_divergence,
+        "steps": alt_steps,
+    }
+
+
+def align(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+    anchors: list[tuple[int, int]] | None = None,
+    compare_alternative: bool = False,
+) -> dict[str, Any]:
+    anchor_pairs: list[tuple[int, int]] = list(anchors or [])
+
+    result = _compute_primary(left, right, anchor_pairs)
+
+    if compare_alternative:
+        result["alternative"] = _find_alternative(
+            left,
+            right,
+            anchor_pairs,
+            result["steps"],
+            result["total_cost"],
+        )
 
     return result

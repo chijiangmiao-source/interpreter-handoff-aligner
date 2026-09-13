@@ -29,6 +29,29 @@ export interface AlignStep {
   origin?: RowOrigin;
 }
 
+/**
+ * Note indices involved at the two paths' first disagreement. An index is
+ * null when the alternative's row at the divergence leaves that side blank.
+ */
+export interface FirstDivergence {
+  left: number | null;
+  right: number | null;
+}
+
+/**
+ * The strictly second-best complete timeline, computed under exactly the
+ * same costs and tie rules as the optimum. Present only when the request
+ * carried `compare_alternative: true`; null then means the legal path is
+ * unique (empty input or anchors pinning every pairing).
+ */
+export interface AlternativeAlignment {
+  steps: AlignStep[];
+  total_cost: Int;
+  /** Always >= 0; zero means an equal-cost alternative resolved by ties. */
+  cost_diff: Int;
+  first_divergence: FirstDivergence;
+}
+
 export interface AlignResponse {
   steps: AlignStep[];
   total_cost: Int;
@@ -36,6 +59,8 @@ export interface AlignResponse {
   costs: { gap: number; mismatch_penalty: number };
   /** Echoed back only for anchored requests. */
   anchors?: Anchor[];
+  /** Present only for compare_alternative requests; null when unique. */
+  alternative?: AlternativeAlignment | null;
 }
 
 export interface ApiError {

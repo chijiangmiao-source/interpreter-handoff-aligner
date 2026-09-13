@@ -295,6 +295,210 @@ test("unanchored request omits anchors and shows no anchor legend", async ({
   await expect(page.getByTestId("legend-anchors")).toHaveCount(0);
 });
 
+test("compare alternative: checkbox off by default, request/response stay legacy", async ({
+  page,
+}) => {
+  const requests: string[] = [];
+  page.on("request", (req) => {
+    if (req.url().includes("/api/align")) requests.push(req.postData() ?? "");
+  });
+  await expect(page.getByTestId("compare-alternative")).not.toBeChecked();
+  await page.getByTestId("submit").click();
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  // No analysis field in either the request or the rendered legacy result.
+  expect(requests[0]).not.toContain("compare_alternative");
+  await expect(page.getByTestId("alternative-summary")).toHaveCount(0);
+  await expect(page.getByTestId("alternative-empty")).toHaveCount(0);
+  await expect(page.getByTestId("alternative-row")).toHaveCount(0);
+});
+
+test("compare alternative: locates the first divergence of the golden tie", async ({
+  page,
+}) => {
+  await page.getByTestId("compare-alternative").check();
+  await page.getByTestId("submit").click();
+
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  // The primary timeline remains the four-row golden timeline.
+  await expect(page.getByTestId("timeline-row")).toHaveCount(4);
+
+  // Equal-cost runner-up selected by the deterministic tie rules.
+  await expect(page.getByTestId("alternative-total")).toHaveText("4250");
+  await expect(page.getByTestId("alternative-diff")).toHaveText("0");
+  const divergence = page.getByTestId("alternative-divergence");
+  await expect(divergence).toContainText("left[∅]");
+  await expect(divergence).toContainText("right[2]");
+
+  // Exactly one expansion row, directly after primary row #3 (index 2), and
+  // the primary row is marked as the divergence point.
+  const altRows = page.getByTestId("alternative-row");
+  await expect(altRows).toHaveCount(1);
+  await expect(altRows.first()).toHaveAttribute("data-row", "2");
+  const rows = page.getByTestId("timeline-row");
+  await expect(rows.nth(2)).toHaveClass(/row-divergence/);
+  await expect(rows.nth(0)).not.toHaveClass(/row-divergence/);
+  // The alternative at that row leaves the LEFT side blank and carries the
+  // right[2] note, while the primary row carries left[2] and leaves right
+  // blank — the swapped gap ordering.
+  const altRow = altRows.first();
+  const altCells = altRow.locator("td");
+  await expect(altCells.nth(1)).toContainText("∅");
+  await expect(altCells.nth(3)).toContainText("交接后的补充记录");
+  await expect(page.getByTestId("alternative-row-gap")).toContainText("成本差 +0");
+});
+
+test("compare alternative: unique empty path shows the empty notice and result", async ({
+  page,
+}) => {
+  await page.getByTestId("clear").click();
+  await page.getByTestId("compare-alternative").check();
+  await page.getByTestId("submit").click();
+
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  await expect(page.getByTestId("total-cost")).toHaveText("0");
+  await expect(page.getByTestId("alternative-empty")).toBeVisible();
+  await expect(page.getByTestId("alternative-summary")).toHaveCount(0);
+  await expect(page.getByTestId("alternative-row")).toHaveCount(0);
+});
+
+test("compare alternative: anchors constrain the runner-up path too", async ({
+  page,
+}) => {
+  const requests: string[] = [];
+  page.on("request", (req) => {
+    if (req.url().includes("/api/align")) requests.push(req.postData() ?? "");
+  });
+  // Pin left[0] <-> right[0] and ask for the runner-up in one request.
+  await page.getByTestId("pick-left-0").click();
+  await page.getByTestId("pick-right-0").click();
+  await page.getByTestId("compare-alternative").check();
+  await page.getByTestId("submit").click();
+
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  // The request carries both the anchors and the comparison flag.
+  expect(requests[0]).toContain('"anchors"');
+  expect(requests[0]).toContain('"compare_alternative":true');
+  // The pinned anchor is row 1 in the primary path, the divergence is at the
+  // tail gap swap, and the alternative keeps the anchor row untouched.
+  const rows = page.getByTestId("timeline-row");
+  await expect(rows.nth(0)).toHaveAttribute("data-origin", "anchor");
+  const altRow = page.getByTestId("alternative-row");
+  await expect(altRow).toHaveCount(1);
+  await expect(altRow.first()).toHaveAttribute("data-row", "2");
+  await expect(page.getByTestId("alternative-diff")).toHaveText("0");
+});
+
+test("live API: compare_alternative ordering, uniqueness, anchors and legacy bytes", async ({
+  request,
+}) => {
+  const payload = {
+    left: [
+      { time: 0, text: "a" },
+      { time: 4000, text: "b" },
+    ],
+    right: [
+      { time: 4000, text: "a" },
+      { time: 8000, text: "b" },
+    ],
+  };
+
+  // 1) Deterministic strict runner-up under the shared cost/tie rules.
+  const resp = await request.post("/api/align", {
+    data: { ...payload, compare_alternative: true },
+  });
+  expect(resp.status()).toBe(200);
+  const body = await resp.json();
+  expect(body.total_cost).toBe(7000);
+  expect(body.alternative.total_cost).toBe(8000);
+  expect(body.alternative.cost_diff).toBe(1000);
+  expect(body.alternative.first_divergence).toEqual({ left: 0, right: 0 });
+  expect(body.alternative.steps.map((s: { action: string }) => s.action)).toEqual([
+    "match",
+    "match",
+  ]);
+  expect(
+    body.alternative.steps.reduce(
+      (acc: number, s: { cost: number }) => acc + s.cost,
+      0,
+    ),
+  ).toBe(8000);
+
+  // Deterministic: asking again returns the identical alternative.
+  const again = await (
+    await request.post("/api/align", {
+      data: { ...payload, compare_alternative: true },
+    })
+  ).json();
+  expect(again.alternative).toEqual(body.alternative);
+
+  // 2) Unique legal path (empty input) -> null alternative, normal optimum.
+  const empty = await (
+    await request.post("/api/align", {
+      data: { left: [], right: [], compare_alternative: true },
+    })
+  ).json();
+  expect(empty.total_cost).toBe(0);
+  expect(empty.alternative).toBeNull();
+
+  // Fully pinning anchors make the path unique as well, and both fields
+  // coexist in one response.
+  const pinned = await (
+    await request.post("/api/align", {
+      data: {
+        left: [{ time: 1, text: "a" }],
+        right: [{ time: 2, text: "a" }],
+        anchors: [{ left: 0, right: 0 }],
+        compare_alternative: true,
+      },
+    })
+  ).json();
+  expect(pinned.anchors).toEqual([{ left: 0, right: 0 }]);
+  expect(pinned.alternative).toBeNull();
+
+  // 3) Anchors constrain the alternative: the anchor row is identical in
+  // both timelines and the runner-up still honours it.
+  const golden = {
+    left: [
+      { time: 0, text: "g" },
+      { time: 4200, text: "p" },
+      { time: 9000, text: "t" },
+    ],
+    right: [
+      { time: 150, text: "g" },
+      { time: 4100, text: "p" },
+      { time: 12000, text: "h" },
+    ],
+  };
+  const anchored = await (
+    await request.post("/api/align", {
+      data: {
+        ...golden,
+        anchors: [{ left: 0, right: 0 }],
+        compare_alternative: true,
+      },
+    })
+  ).json();
+  expect(anchored.alternative.cost_diff).toBe(0);
+  const primaryAnchor = anchored.steps.filter(
+    (s: { origin?: string }) => s.origin === "anchor",
+  );
+  const altAnchor = anchored.alternative.steps.filter(
+    (s: { origin?: string }) => s.origin === "anchor",
+  );
+  expect(altAnchor).toEqual(primaryAnchor);
+  expect(altAnchor).toHaveLength(1);
+
+  // 4) Legacy requests add no analysis field to the response structure.
+  const legacy = await (await request.post("/api/align", { data: payload })).text();
+  expect(legacy).not.toContain("alternative");
+  const legacyFalse = await (
+    await request.post("/api/align", {
+      data: { ...payload, compare_alternative: false },
+    })
+  ).text();
+  expect(legacyFalse).toBe(legacy);
+});
+
 test("live API: valid anchors fix the pairs, crossing fails once, cancelling restores", async ({
   request,
 }) => {

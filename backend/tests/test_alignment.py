@@ -2,7 +2,7 @@
 
 import itertools
 import random
-from functools import lru_cache
+from functools import cmp_to_key, lru_cache
 
 from app.alignment import (
     GAP_COST,
@@ -420,3 +420,300 @@ def test_removing_all_anchors_restores_free_result():
     again = align(left, right, None)
     assert again == free
     assert all("origin" not in s for s in again["steps"])
+
+
+# --------------------------------------------------------------------------- #
+# Strictly second-best ("alternative") complete path.
+# --------------------------------------------------------------------------- #
+
+
+def _step_sig(step: dict):
+    def nk(item):
+        return None if item is None else (item["time"], item["text"])
+
+    return step["action"], nk(step["left"]), nk(step["right"]), step["cost"]
+
+
+def _enumerate_paths(left, right, anchors=()):
+    """Every distinct complete path (signature tuple -> total cost)."""
+    m, n = len(left), len(right)
+    bounds = [(-1, -1), *anchors, (m, n)]
+
+    def seg_paths(li, lj, i1, j1):
+        out = []
+
+        def rec(i, j, acc, cost):
+            if i == i1 and j == j1:
+                out.append((tuple(acc), cost))
+                return
+            if i < i1 and j < j1:
+                c = abs(left[i]["time"] - right[j]["time"]) + (
+                    0 if left[i]["text"] == right[j]["text"] else MISMATCH_PENALTY
+                )
+                rec(
+                    i + 1,
+                    j + 1,
+                    acc + [("match", (left[i]["time"], left[i]["text"]),
+                            (right[j]["time"], right[j]["text"]), c)],
+                    cost + c,
+                )
+            if j < j1:
+                rec(i, j + 1, acc + [("left_gap", None,
+                                      (right[j]["time"], right[j]["text"]), GAP_COST)],
+                    cost + GAP_COST)
+            if i < i1:
+                rec(i + 1, j, acc + [("right_gap",
+                                      (left[i]["time"], left[i]["text"]), None, GAP_COST)],
+                    cost + GAP_COST)
+
+        rec(li, lj, [], 0)
+        return out
+
+    partials = [((), 0)]
+    for (a0, b0), (a1, b1) in zip(bounds, bounds[1:]):
+        paths = seg_paths(a0 + 1, b0 + 1, a1, b1)
+        if a1 < m:
+            c = abs(left[a1]["time"] - right[b1]["time"]) + (
+                0 if left[a1]["text"] == right[b1]["text"] else MISMATCH_PENALTY
+            )
+            anchor = (("match", (left[a1]["time"], left[a1]["text"]),
+                       (right[b1]["time"], right[b1]["text"]), c),)
+        else:
+            anchor = ()
+        partials = [
+            (p + q + anchor, c0 + c + (anchor[0][3] if anchor else 0))
+            for p, c0 in partials
+            for q, c in paths
+        ]
+    return dict(partials)
+
+
+_ACTION_CODE = {"match": 1, "left_gap": 2, "right_gap": 3}
+
+
+def _compare_paths(p, q):
+    """Independent total order: cost, then action at the last differing step."""
+    a, ca = p
+    b, cb = q
+    if ca != cb:
+        return -1 if ca < cb else 1
+    for k in range(1, min(len(a), len(b)) + 1):
+        if a[-k] != b[-k]:
+            return -1 if _ACTION_CODE[a[-k][0]] < _ACTION_CODE[b[-k][0]] else 1
+    raise AssertionError("distinct paths share their entire shorter suffix")
+
+
+def _ranked(left, right, anchors=()):
+    return sorted(
+        _enumerate_paths(left, right, anchors).items(),
+        key=cmp_to_key(_compare_paths),
+    )
+
+
+def test_compare_flag_off_keeps_legacy_shape_exactly():
+    left = [note(0, "a"), note(4000, "b")]
+    right = [note(4000, "a"), note(8000, "b")]
+    plain = align(left, right)
+    # Default and explicit false are the legacy call: no analysis field.
+    assert align(left, right, compare_alternative=False) == plain
+    assert "alternative" not in plain
+    assert align(left, right, anchors=None, compare_alternative=False) == plain
+    assert align(left, right, anchors=[(0, 0)], compare_alternative=False) == align(
+        left, right, anchors=[(0, 0)]
+    )
+
+
+def test_alternative_is_strict_second_path_with_cost_and_gap():
+    # Primary: right_gap + mismatch match(4000,4000) + left_gap = 2000+3000+2000.
+    # Runner-up: two same-text diagonal matches = 4000 + 4000 = 8000.
+    left = [note(0, "a"), note(4000, "b")]
+    right = [note(4000, "a"), note(8000, "b")]
+    result = align(left, right, compare_alternative=True)
+
+    assert result["total_cost"] == 7000
+    alt = result["alternative"]
+    assert alt["total_cost"] == 8000
+    assert alt["cost_diff"] == 1000
+    assert [(s["action"], s["cost"]) for s in alt["steps"]] == [
+        ("match", 4000),
+        ("match", 4000),
+    ]
+    # The rows disagree from the very first step, which consumes left[0]/right[0].
+    assert alt["first_divergence"] == {"left": 0, "right": 0}
+    # Alternative rows replay their own total via cumulative costs.
+    cum = 0
+    for step in alt["steps"]:
+        cum += step["cost"]
+        assert step["cumulative_cost"] == cum
+    assert cum == alt["total_cost"]
+    # Every note is consumed exactly once, in order.
+    assert [s["left"]["time"] for s in alt["steps"] if s["left"]] == [0, 4000]
+    assert [s["right"]["time"] for s in alt["steps"] if s["right"]] == [4000, 8000]
+    assert "origin" not in alt["steps"][0]
+
+
+def test_alternative_tie_cost_diff_zero_uses_tie_rules():
+    # The golden tail: two gap orderings share total 4250; the last-step
+    # preference (left gap over right gap) fixes the runner-up deterministically.
+    left = [note(0, "g"), note(4200, "p"), note(9000, "t")]
+    right = [note(150, "g"), note(4100, "p"), note(12000, "h")]
+    result = align(left, right, compare_alternative=True)
+    alt = result["alternative"]
+    assert result["total_cost"] == alt["total_cost"] == 4250
+    assert alt["cost_diff"] == 0
+    # The first two matches are shared; the paths split on the gap ordering,
+    # and the alternative's first differing row leaves the LEFT side blank
+    # while carrying right[2], so only the right index (2) is reported.
+    assert alt["first_divergence"] == {"left": None, "right": 2}
+    primary_actions = [s["action"] for s in result["steps"]]
+    alt_actions = [s["action"] for s in alt["steps"]]
+    assert primary_actions == ["match", "match", "right_gap", "left_gap"]
+    assert alt_actions == ["match", "match", "left_gap", "right_gap"]
+
+
+def test_empty_input_has_no_alternative():
+    result = align([], [], compare_alternative=True)
+    assert result["total_cost"] == 0
+    assert result["steps"] == []
+    assert result["alternative"] is None
+
+
+def test_one_side_empty_has_no_alternative():
+    # A single note has exactly one legal row, so the path is unique.
+    result = align([note(1, "a")], [], compare_alternative=True)
+    assert result["alternative"] is None
+    result = align([], [note(1, "a")], compare_alternative=True)
+    assert result["alternative"] is None
+
+
+def test_fully_pinning_anchors_make_the_path_unique():
+    # Forcing the only note pair pins the complete path.
+    result = align(
+        [note(1, "a")], [note(2, "a")],
+        anchors=[(0, 0)], compare_alternative=True,
+    )
+    assert result["alternative"] is None
+
+    # Two anchors split the grid into border-only segments: still unique.
+    left = [note(0, "a"), note(5000, "b")]
+    right = [note(10, "a"), note(5200, "b")]
+    result = align(
+        left, right, anchors=[(0, 0), (1, 1)], compare_alternative=True
+    )
+    assert result["alternative"] is None
+
+
+def test_anchors_constrain_the_alternative_as_well():
+    # The free runner-up swaps the tail gap order at index 2. Pinning the
+    # opening pair leaves that freedom; pinning additionally through left[1]
+    # removes it, so the alternative must change / disappear accordingly.
+    left = [note(0, "g"), note(4200, "p"), note(9000, "t")]
+    right = [note(150, "g"), note(4100, "p"), note(12000, "h")]
+
+    pinned = align(left, right, anchors=[(0, 0)], compare_alternative=True)
+    alt = pinned["alternative"]
+    assert alt is not None and alt["cost_diff"] == 0
+    # The forced anchor row is present identically in both paths.
+    anchor_rows = [s for s in pinned["steps"] if s.get("origin") == ORIGIN_ANCHOR]
+    alt_anchor_rows = [s for s in alt["steps"] if s.get("origin") == ORIGIN_ANCHOR]
+    assert len(anchor_rows) == len(alt_anchor_rows) == 1
+    assert anchor_rows[0] == alt_anchor_rows[0]
+    assert all(s.get("origin") == ORIGIN_AUTO
+               for s in alt["steps"] if s.get("origin") != ORIGIN_ANCHOR)
+
+    full = align(
+        left, right, anchors=[(0, 0), (1, 1)], compare_alternative=True
+    )
+    # Remaining notes are one gap on each side: the two gap orders tie, so an
+    # equal-cost alternative still exists but both pairs stay anchored.
+    assert full["alternative"] is not None
+    assert full["alternative"]["cost_diff"] == 0
+    assert sum(s.get("origin") == ORIGIN_ANCHOR
+               for s in full["alternative"]["steps"]) == 2
+
+
+def test_alternative_is_deterministic():
+    left = [note(0, "a"), note(4000, "b")]
+    right = [note(4000, "a"), note(8000, "b")]
+    first = align(left, right, compare_alternative=True)["alternative"]
+    for _ in range(5):
+        again = align(left, right, compare_alternative=True)["alternative"]
+        assert again == first
+
+
+def test_alternative_exhaustive_against_independent_enumeration():
+    rng = random.Random(20260913)
+    cases = 0
+    for trial in range(600):
+        m = rng.randrange(0, 5)
+        nn = rng.randrange(0, 5)
+        left, right = [], []
+        t = 0
+        for _ in range(m):
+            t += rng.randrange(1, 7) * 1000
+            left.append(note(t, rng.choice(("a", "b"))))
+        t = 0
+        for _ in range(nn):
+            t += rng.randrange(1, 7) * 1000
+            right.append(note(t, rng.choice(("a", "b"))))
+
+        k = rng.randrange(0, min(m, nn) + 1)
+        anchors = list(zip(
+            sorted(rng.sample(range(m), k)),
+            sorted(rng.sample(range(nn), k)),
+        ))
+
+        result = align(
+            left, right, anchors=anchors or None, compare_alternative=True
+        )
+        ranked = _ranked(left, right, anchors)
+        best1, cost1 = ranked[0]
+        best2 = ranked[1] if len(ranked) > 1 else None
+
+        assert tuple(_step_sig(s) for s in result["steps"]) == best1
+        assert result["total_cost"] == cost1
+
+        alt = result["alternative"]
+        if best2 is None:
+            assert alt is None
+        else:
+            sig2, cost2 = best2
+            assert alt is not None
+            assert tuple(_step_sig(s) for s in alt["steps"]) == sig2
+            assert alt["total_cost"] == cost2
+            assert alt["cost_diff"] == cost2 - cost1
+
+            primary_sigs = [_step_sig(s) for s in result["steps"]]
+            alt_sigs = [_step_sig(s) for s in alt["steps"]]
+            d = next(
+                k
+                for k in range(min(len(primary_sigs), len(alt_sigs)))
+                if primary_sigs[k] != alt_sigs[k]
+            )
+            lc = sum(1 for s in primary_sigs[:d] if s[1] is not None)
+            rc = sum(1 for s in primary_sigs[:d] if s[2] is not None)
+            assert alt["first_divergence"] == {
+                "left": lc if alt_sigs[d][1] is not None else None,
+                "right": rc if alt_sigs[d][2] is not None else None,
+            }
+            # Validity invariants of the alternative timeline.
+            assert [s["left"]["time"] for s in alt["steps"] if s["left"]] == [
+                x["time"] for x in left
+            ]
+            assert [s["right"]["time"] for s in alt["steps"] if s["right"]] == [
+                x["time"] for x in right
+            ]
+        cases += 1
+    assert cases == 600
+
+
+def test_alternative_large_inputs_200_items():
+    left = [note(i * 1000, f"t{i}") for i in range(200)]
+    right = [note(i * 1000 + 3, f"t{i}") for i in range(200)]
+    result = align(left, right, compare_alternative=True)
+    alt = result["alternative"]
+    assert alt is not None
+    assert alt["cost_diff"] >= 0
+    assert sum(s["cost"] for s in alt["steps"]) == alt["total_cost"]
+    assert len([s for s in alt["steps"] if s["left"]]) == 200
+    assert len([s for s in alt["steps"] if s["right"]]) == 200
