@@ -73,6 +73,11 @@ export default function App() {
   // sample or clearing the inputs always starts from no pending pick.
   const [selLeft, setSelLeft] = useState<number | null>(null);
   const [selRight, setSelRight] = useState<number | null>(null);
+  // Half-typed term drafts live here too (not in the panel), so loading the
+  // sample or clearing the page discards even a one-sided draft and the next
+  // pair starts from two blank fields.
+  const [termLeftDraft, setTermLeftDraft] = useState("");
+  const [termRightDraft, setTermRightDraft] = useState("");
   const [error, setError] = useState<MarkedError | null>(null);
   const [result, setResult] = useState<AlignResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -212,6 +217,10 @@ export default function App() {
     const tentative = [...termPairs, candidate];
     setTermPairs(tentative);
     applyTermIssue(validateTermPairs(tentative));
+    // The candidate is always appended (a conflict stays listed and flagged
+    // in place), so the verbatim drafts start a fresh blank pair.
+    setTermLeftDraft("");
+    setTermRightDraft("");
   }
 
   function removeTermPair(index: number) {
@@ -438,6 +447,8 @@ export default function App() {
     setSelLeft(null);
     setSelRight(null);
     setTermPairs([]);
+    setTermLeftDraft("");
+    setTermRightDraft("");
     setError(null);
     setResult(null);
     setRevealed(0);
@@ -451,6 +462,8 @@ export default function App() {
     setSelLeft(null);
     setSelRight(null);
     setTermPairs([]);
+    setTermLeftDraft("");
+    setTermRightDraft("");
     setError(null);
     setResult(null);
     setRevealed(0);
@@ -526,6 +539,10 @@ export default function App() {
       <TermPairPanel
         termPairs={termPairs}
         errorIndex={flaggedTermIndex}
+        leftDraft={termLeftDraft}
+        rightDraft={termRightDraft}
+        onDraftLeft={setTermLeftDraft}
+        onDraftRight={setTermRightDraft}
         onAdd={addTermPair}
         onRemove={removeTermPair}
       />

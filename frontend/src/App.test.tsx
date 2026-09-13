@@ -859,7 +859,7 @@ describe("App: term pairs", () => {
     expect(screen.queryAllByTestId("term-item")).toHaveLength(0);
   });
 
-  it("adds a term pair from the two inputs and removes it", () => {
+  it("adds a term pair verbatim (leading/trailing spaces kept) and removes it", () => {
     render(<App />);
     fireEvent.change(screen.getByTestId("term-input-left"), {
       target: { value: " 人工智能 " },
@@ -871,14 +871,86 @@ describe("App: term pairs", () => {
 
     const items = screen.getAllByTestId("term-item");
     expect(items).toHaveLength(1);
-    // Drafts are trimmed when stored and cleared after adding.
-    expect(items[0]).toHaveTextContent("人工智能");
-    expect(items[0]).toHaveTextContent("AI");
+    // Drafts are stored character-for-character (no trimming) and cleared.
+    expect(
+      screen.getAllByTestId("term-item-left")[0].textContent,
+    ).toBe(" 人工智能 ");
+    expect(screen.getAllByTestId("term-item-right")[0].textContent).toBe("AI");
     expect((screen.getByTestId("term-input-left") as HTMLInputElement).value).toBe(
       "",
     );
 
     fireEvent.click(screen.getByTestId("term-remove-0"));
+    expect(screen.queryAllByTestId("term-item")).toHaveLength(0);
+    expect(screen.getByTestId("term-empty")).toBeInTheDocument();
+  });
+
+  it("sends verbatim term texts including leading and trailing spaces", async () => {
+    let sentBody = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sentBody = init!.body as string;
+        return new Response(JSON.stringify(termBody), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    render(<App />);
+    fireEvent.change(screen.getByTestId("term-input-left"), {
+      target: { value: " 人工智能 " },
+    });
+    fireEvent.change(screen.getByTestId("term-input-right"), {
+      target: { value: " AI " },
+    });
+    fireEvent.click(screen.getByTestId("term-add"));
+    fireEvent.click(screen.getByTestId("submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    expect(sentBody).toContain(
+      `"term_pairs":[{"left_text":" 人工智能 ","right_text":" AI "}]`,
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("accepts a whitespace-only draft as a real (non-empty) term", () => {
+    render(<App />);
+    const addButton = screen.getByTestId("term-add") as HTMLButtonElement;
+    expect(addButton).toBeDisabled();
+    fireEvent.change(screen.getByTestId("term-input-left"), {
+      target: { value: " " },
+    });
+    fireEvent.change(screen.getByTestId("term-input-right"), {
+      target: { value: "AI" },
+    });
+    expect(addButton).not.toBeDisabled();
+    fireEvent.click(addButton);
+    expect(screen.getAllByTestId("term-item-left")[0].textContent).toBe(" ");
+  });
+
+  it("discards a one-sided term draft when the sample is loaded or page cleared", () => {
+    render(<App />);
+    const leftInput = () =>
+      screen.getByTestId("term-input-left") as HTMLInputElement;
+    const rightInput = () =>
+      screen.getByTestId("term-input-right") as HTMLInputElement;
+
+    // Type only the left side, then reset with the sample: the stale draft
+    // must not remain in the input box.
+    fireEvent.change(leftInput(), { target: { value: "旧草稿" } });
+    expect(leftInput().value).toBe("旧草稿");
+    fireEvent.click(screen.getByTestId("sample"));
+    expect(leftInput().value).toBe("");
+    expect(rightInput().value).toBe("");
+
+    // Same after clearing the page, including a right-only draft.
+    fireEvent.change(rightInput(), { target: { value: "AI" } });
+    fireEvent.click(screen.getByTestId("clear"));
+    expect(leftInput().value).toBe("");
+    expect(rightInput().value).toBe("");
+    // A fresh, blank term draft can be started with no leftover rows.
     expect(screen.queryAllByTestId("term-item")).toHaveLength(0);
     expect(screen.getByTestId("term-empty")).toBeInTheDocument();
   });
@@ -994,6 +1066,59 @@ describe("App: term pairs", () => {
     );
     expect(screen.getByTestId("legend-terms")).toBeInTheDocument();
     expect(screen.getByTestId("total-cost").textContent).toBe("300");
+    vi.unstubAllGlobals();
+  });
+
+  it("marks an equal-text declared pair's hit row with the term-pair source", async () => {
+    const sameTextBody = {
+      steps: [
+        {
+          action: "match",
+          left: { time: 0, text: "新产品将于下月上市" },
+          right: { time: 100, text: "新产品将于下月上市" },
+          cost: 100,
+          cumulative_cost: 100,
+          term_pair: {
+            left_text: "新产品将于下月上市",
+            right_text: "新产品将于下月上市",
+          },
+        },
+      ],
+      total_cost: 100,
+      counts: { match: 1, left_gap: 0, right_gap: 0 },
+      costs: { gap: 2000, mismatch_penalty: 3000 },
+      term_pairs: [
+        {
+          left_text: "新产品将于下月上市",
+          right_text: "新产品将于下月上市",
+        },
+      ],
+    };
+    vi.stubGlobal("fetch", mockFetchOnce(sameTextBody));
+    render(<App />);
+    fireEvent.change(screen.getByTestId("term-input-left"), {
+      target: { value: "新产品将于下月上市" },
+    });
+    fireEvent.change(screen.getByTestId("term-input-right"), {
+      target: { value: "新产品将于下月上市" },
+    });
+    fireEvent.click(screen.getByTestId("term-add"));
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    const row = screen.getAllByTestId("timeline-row")[0];
+    // Even though both notes read the same, the declared pair is the source.
+    expect(row).toHaveAttribute("data-term-hit", "true");
+    expect(screen.getByTestId("step-term").textContent).toBe("术语等价");
+    expect(screen.getByTestId("step-explain").textContent).toMatch(
+      /术语等价.*新产品将于下月上市 ≡ 新产品将于下月上市/,
+    );
+    // Equal texts carried no mismatch penalty, so none is "waived".
+    expect(screen.getByTestId("step-explain").textContent).not.toContain(
+      "免除 3000",
+    );
     vi.unstubAllGlobals();
   });
 

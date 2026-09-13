@@ -432,6 +432,8 @@ button.primary:hover:not(:disabled) {
   color: var(--term);
   padding: 1px 6px;
   border-radius: 4px;
+  /* Declared terms are verbatim: keep leading/trailing spaces visible. */
+  white-space: pre-wrap;
 }
 
 .term-remove {

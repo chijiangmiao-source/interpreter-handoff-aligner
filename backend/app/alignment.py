@@ -46,8 +46,9 @@ correspondences.  Only a pairing whose two note texts are an EXACT hit of a
 declared pair is treated as synonymous: the mismatch penalty is waived and
 the pair costs the plain time difference.  Time-difference costs, gap costs,
 anchor constraints, the tie-break order and the alternative-path ranking are
-all unchanged.  Hit match rows (including forced anchor matches and the
-alternative's matches) carry the ``term_pair`` they hit, and a non-empty
+all unchanged.  Hit match rows (including a hit on a pair whose two declared
+texts are themselves equal, forced anchor matches and the alternative's
+matches) carry the ``term_pair`` they hit as their source, and a non-empty
 request echoes ``term_pairs``; absent or empty, request computation and the
 response shape stay byte-for-byte identical to before.
 
@@ -135,19 +136,20 @@ def term_hit(
     return terms.hit(left_item["text"], right_item["text"])
 
 
-def waived_term_pair(
+def hit_term_pair(
     left_item: dict[str, Any],
     right_item: dict[str, Any],
     terms: TermSynonyms | None,
 ) -> tuple[str, str] | None:
-    """Declared pair that actually waives the penalty for this pairing.
+    """Declared pair an exact pairing of these notes hits, if any.
 
-    An exact hit only matters as term provenance when the two texts would
-    otherwise differ (and hence be penalized); equal-text pairings already
-    match on their own, so they keep the ordinary same-text presentation.
+    Provenance is reported on every match row that is an exact declared hit,
+    including a pair whose two declared texts are themselves equal: the lead
+    declared the correspondence for this review, so the row's source is the
+    term pair rather than an incidental same-text match.  An equal-text
+    pairing without a declaration still returns None and keeps the ordinary
+    same-text presentation.
     """
-    if left_item["text"] == right_item["text"]:
-        return None
     return term_hit(left_item, right_item, terms)
 
 
@@ -284,7 +286,7 @@ def _trace_segment(
             out.append(
                 _make_step(
                     ACTION_MATCH, l, r, match_cost(l, r, terms),
-                    origin=ORIGIN_AUTO, term_pair=waived_term_pair(l, r, terms),
+                    origin=ORIGIN_AUTO, term_pair=hit_term_pair(l, r, terms),
                 )
             )
             i, j = i - 1, j - 1
@@ -374,7 +376,7 @@ def _compute_primary(
         steps.append(
             _make_step(
                 ACTION_MATCH, l, r, anchor_cost, origin=ORIGIN_ANCHOR,
-                term_pair=waived_term_pair(l, r, terms),
+                term_pair=hit_term_pair(l, r, terms),
             )
         )
 
@@ -428,7 +430,7 @@ def _finalize(
 
     if term_pairs:
         # Term-aware run: echo the declared correspondences so the UI keeps
-        # the panel and can attribute each waived-penalty row to its pair.
+        # the panel and can attribute each exact-hit row to its pair.
         result["term_pairs"] = [
             {"left_text": lt, "right_text": rt} for lt, rt in term_pairs
         ]
@@ -523,7 +525,7 @@ def _edge_step(
         l, r = left[i - 1], right[j - 1]
         return _make_step(
             ACTION_MATCH, l, r, match_cost(l, r, terms), origin=origin,
-            term_pair=waived_term_pair(l, r, terms),
+            term_pair=hit_term_pair(l, r, terms),
         )
     if action == ACTION_LEFT_GAP:
         return _make_step(
@@ -714,7 +716,7 @@ def _find_alternative(
             alt_steps.append(
                 _make_step(
                     ACTION_MATCH, l, r, match_cost(l, r, terms),
-                    origin=ORIGIN_ANCHOR, term_pair=waived_term_pair(l, r, terms),
+                    origin=ORIGIN_ANCHOR, term_pair=hit_term_pair(l, r, terms),
                 )
             )
 

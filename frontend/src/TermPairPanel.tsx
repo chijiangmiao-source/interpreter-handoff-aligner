@@ -1,11 +1,19 @@
-import { useState } from "react";
 import type { TermPair } from "./types";
 
 interface Props {
   termPairs: TermPair[];
   /** Index of the term pair the server/client flagged, -1 when none. */
   errorIndex: number;
-  /** Append a candidate pair; the parent flags same-side conflicts. */
+  /**
+   * The half-typed pair lives in the parent (like the anchor pick selection),
+   * so loading the sample or clearing the page also discards a one-sided
+   * draft and every term entry starts from two blank fields.
+   */
+  leftDraft: string;
+  rightDraft: string;
+  onDraftLeft: (value: string) => void;
+  onDraftRight: (value: string) => void;
+  /** Append a candidate pair verbatim; the parent flags same-side conflicts. */
   onAdd: (pair: TermPair) => void;
   onRemove: (index: number) => void;
 }
@@ -18,6 +26,11 @@ interface Props {
  * everything else (time difference, gaps, anchors, ties, alternative ranking)
  * keeps using the current rules.
  *
+ * The declared texts are stored and sent VERBATIM, leading and trailing
+ * spaces included: "exact" means character-for-character, so the panel never
+ * trims or otherwise rewrites what the lead typed. A pair is only submittable
+ * while both drafts are non-empty (whitespace-only is still a real term).
+ *
  * The pair list and the conflict flag live in the parent (mirrored server
  * validation): like a crossing anchor, a same-side duplicate mapping is kept
  * and flagged in place exactly once instead of being silently dropped, and
@@ -27,21 +40,18 @@ interface Props {
 export default function TermPairPanel({
   termPairs,
   errorIndex,
+  leftDraft,
+  rightDraft,
+  onDraftLeft,
+  onDraftRight,
   onAdd,
   onRemove,
 }: Props) {
-  const [leftDraft, setLeftDraft] = useState("");
-  const [rightDraft, setRightDraft] = useState("");
-
   function submitPair() {
-    const left = leftDraft.trim();
-    const right = rightDraft.trim();
-    if (!left || !right) return;
-    onAdd({ left_text: left, right_text: right });
-    // The candidate is always appended (a conflict stays listed and flagged
-    // in place), so the drafts can start a fresh pair.
-    setLeftDraft("");
-    setRightDraft("");
+    // Verbatim: no trimming or other normalization. The parent clears both
+    // drafts once the candidate has been appended.
+    if (leftDraft.length === 0 || rightDraft.length === 0) return;
+    onAdd({ left_text: leftDraft, right_text: rightDraft });
   }
 
   return (
@@ -49,8 +59,8 @@ export default function TermPairPanel({
       <h2>复盘认可的术语对应</h2>
       <p className="term-hint" data-testid="term-hint">
         录入两名口译员对同一专名的不同译法：仅当配对的两条文本与某条术语对
-        <strong>完全一致</strong>时视为同义，免除「文本不一致」的 3000 罚分；
-        时间差、留空代价、锚点约束、平局顺序与备选路径排序均不变。
+        <strong>完全一致（逐字保留，含首尾空格）</strong>时视为同义，免除「文本不一致」的 3000
+        罚分；时间差、留空代价、锚点约束、平局顺序与备选路径排序均不变。
       </p>
       <div className="term-entry">
         <input
@@ -59,7 +69,7 @@ export default function TermPairPanel({
           data-testid="term-input-left"
           value={leftDraft}
           placeholder="左侧译法，如 人工智能"
-          onChange={(e) => setLeftDraft(e.target.value)}
+          onChange={(e) => onDraftLeft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") submitPair();
           }}
@@ -71,7 +81,7 @@ export default function TermPairPanel({
           data-testid="term-input-right"
           value={rightDraft}
           placeholder="右侧译法，如 AI"
-          onChange={(e) => setRightDraft(e.target.value)}
+          onChange={(e) => onDraftRight(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") submitPair();
           }}
@@ -81,7 +91,7 @@ export default function TermPairPanel({
           className="term-add"
           data-testid="term-add"
           onClick={submitPair}
-          disabled={!leftDraft.trim() || !rightDraft.trim()}
+          disabled={leftDraft.length === 0 || rightDraft.length === 0}
         >
           添加对应
         </button>

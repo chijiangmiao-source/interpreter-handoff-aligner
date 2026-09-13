@@ -548,6 +548,60 @@ def test_term_pair_exact_hit_waives_penalty_and_echoes_the_pair():
     assert data["total_cost"] == 300
 
 
+def test_term_pair_same_text_pair_marks_equal_text_note_match():
+    payload = {
+        "left": [{"time": 0, "text": "新产品将于下月上市"}],
+        "right": [{"time": 100, "text": "新产品将于下月上市"}],
+        "term_pairs": [
+            {"left_text": "新产品将于下月上市",
+             "right_text": "新产品将于下月上市"}
+        ],
+    }
+    data = post(payload).json()
+    row = data["steps"][0]
+    assert row["cost"] == 100
+    assert row["term_pair"] == {
+        "left_text": "新产品将于下月上市",
+        "right_text": "新产品将于下月上市",
+    }
+
+    # Without the declaration the identical equal-text row stays unmarked.
+    plain = post({
+        "left": payload["left"],
+        "right": payload["right"],
+    }).json()
+    assert "term_pair" not in plain["steps"][0]
+
+
+def test_term_pair_leading_and_trailing_spaces_are_preserved_verbatim():
+    # The exact-hit comparison is verbatim; leading/trailing spaces declared
+    # by the lead must survive the round trip and hit notes carrying them.
+    payload = {
+        "left": [{"time": 0, "text": " 人工智能 "}],
+        "right": [{"time": 100, "text": " AI "}],
+        "term_pairs": [
+            {"left_text": " 人工智能 ", "right_text": " AI "}
+        ],
+    }
+    data = post(payload).json()
+    assert data["term_pairs"] == [
+        {"left_text": " 人工智能 ", "right_text": " AI "}
+    ]
+    row = data["steps"][0]
+    assert row["cost"] == 100
+    assert row["term_pair"] == {
+        "left_text": " 人工智能 ", "right_text": " AI "
+    }
+
+    # A declaration whose spaces were not part of the note text never hits.
+    miss = post({
+        **payload,
+        "term_pairs": [{"left_text": "人工智能", "right_text": "AI"}],
+    }).json()
+    assert miss["total_cost"] == 3100
+    assert "term_pair" not in miss["steps"][0]
+
+
 def test_term_pair_miss_keeps_the_mismatch_penalty_and_marker_absent():
     payload = {
         "left": [{"time": 0, "text": "x"}],

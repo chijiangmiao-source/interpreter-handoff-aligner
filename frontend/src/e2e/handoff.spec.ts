@@ -577,11 +577,11 @@ test.describe("term pairs", () => {
     page,
   }) => {
     const left = JSON.stringify([
-      { time: 0, text: "人工智能" },
+      { time: 0, text: " 人工智能 " },
       { time: 9000, text: "结束语" },
     ]);
     const right = JSON.stringify([
-      { time: 100, text: "AI" },
+      { time: 100, text: " AI " },
       { time: 9200, text: "结束语" },
     ]);
     await page.getByTestId("input-left").fill(left);
@@ -592,19 +592,35 @@ test.describe("term pairs", () => {
     await expect(page.getByTestId("result-panel")).toBeVisible();
     await expect(page.getByTestId("total-cost")).toHaveText("3300");
 
-    // Declare 人工智能 <-> AI, then realign.
-    await page
-      .getByTestId("term-input-left")
-      .fill(" 人工智能 "); // trimming is verified below
-    await page.getByTestId("term-input-right").fill("AI");
+    // Declare the pair with leading/trailing spaces; "exact" is verbatim, so
+    // every declared character is preserved and sent character-for-character.
+    const requests: string[] = [];
+    page.on("request", (req) => {
+      if (req.url().includes("/api/align")) requests.push(req.postData() ?? "");
+    });
+    await page.getByTestId("term-input-left").fill(" 人工智能 ");
+    await page.getByTestId("term-input-right").fill(" AI ");
     await page.getByTestId("term-add").click();
     const items = page.getByTestId("term-item");
     await expect(items).toHaveCount(1);
-    await expect(items.first()).toContainText("人工智能");
-    await expect(items.first()).toContainText("AI");
+    // The declared spaces are kept in the list row (no trimming on save).
+    expect(
+      await items.first().getByTestId("term-item-left").textContent(),
+    ).toBe(" 人工智能 ");
+    expect(
+      await items.first().getByTestId("term-item-right").textContent(),
+    ).toBe(" AI ");
+    // Both draft fields start the next pair blank.
+    await expect(page.getByTestId("term-input-left")).toHaveValue("");
+    await expect(page.getByTestId("term-input-right")).toHaveValue("");
 
     await page.getByTestId("submit").click();
     await expect(page.getByTestId("result-panel")).toBeVisible();
+
+    // The request carries the texts character-for-character, spaces included.
+    expect(requests.at(-1)).toContain(
+      `"term_pairs":[{"left_text":" 人工智能 ","right_text":" AI "}]`,
+    );
 
     const rows = page.getByTestId("timeline-row");
     await expect(rows).toHaveCount(2);
@@ -622,6 +638,50 @@ test.describe("term pairs", () => {
     );
     await expect(page.getByTestId("step-explain").nth(0)).toContainText("免除 3000");
     await expect(page.getByTestId("legend-terms")).toBeVisible();
+  });
+
+  test("a half-typed one-sided term draft is discarded by load-sample and clear", async ({
+    page,
+  }) => {
+    // Only one side is filled: the pair was never added, but the draft must
+    // not survive a page reset.
+    await page.getByTestId("term-input-left").fill("只写了左侧");
+    await page.getByTestId("clear").click();
+    await expect(page.getByTestId("term-input-left")).toHaveValue("");
+    await expect(page.getByTestId("term-input-right")).toHaveValue("");
+    await expect(page.getByTestId("term-empty")).toBeVisible();
+
+    // Loading the sample resets a right-only draft the same way.
+    await page.getByTestId("term-input-right").fill(" AI ");
+    await page.getByTestId("sample").click();
+    await expect(page.getByTestId("term-input-left")).toHaveValue("");
+    await expect(page.getByTestId("term-input-right")).toHaveValue("");
+    await expect(page.getByTestId("term-empty")).toBeVisible();
+  });
+
+  test("a declared pair with identical left/right text marks the equal-text match", async ({
+    page,
+  }) => {
+    // Both interpreters wrote the same text; the lead nonetheless declares
+    // that text as an accepted term pair for this review.
+    const same = JSON.stringify([{ time: 0, text: "新产品将于下月上市" }]);
+    await page.getByTestId("input-left").fill(same);
+    await page.getByTestId("input-right").fill(
+      JSON.stringify([{ time: 100, text: "新产品将于下月上市" }]),
+    );
+    await page.getByTestId("term-input-left").fill("新产品将于下月上市");
+    await page.getByTestId("term-input-right").fill("新产品将于下月上市");
+    await page.getByTestId("term-add").click();
+    await page.getByTestId("submit").click();
+
+    await expect(page.getByTestId("result-panel")).toBeVisible();
+    const row = page.getByTestId("timeline-row");
+    await expect(row).toHaveCount(1);
+    // The equal-text match is attributed to the declared pair as its source.
+    await expect(row).toHaveAttribute("data-term-hit", "true");
+    await expect(page.getByTestId("step-term")).toHaveText("术语等价");
+    await expect(page.getByTestId("step-cost")).toHaveText("100");
+    await expect(page.getByTestId("total-cost")).toHaveText("100");
   });
 
   test("deleting every term pair restores the original penalized result", async ({
@@ -776,6 +836,47 @@ test("live API: term pairs waive the penalty only on exact hits and stay legacy-
   ).json();
   expect(miss.total_cost).toBe(3300);
   expect("term_pair" in miss.steps[0]).toBe(false);
+
+  // 3b) Declared spaces are part of the term: an exact verbatim hit waives
+  //     the penalty, while notes without those spaces do not hit.
+  const spaced = await (
+    await request.post("/api/align", {
+      data: {
+        left: [{ time: 0, text: " 人工智能 " }],
+        right: [{ time: 100, text: " AI " }],
+        term_pairs: [{ left_text: " 人工智能 ", right_text: " AI " }],
+      },
+    })
+  ).json();
+  expect(spaced.term_pairs).toEqual([
+    { left_text: " 人工智能 ", right_text: " AI " },
+  ]);
+  expect(spaced.steps[0].term_pair).toEqual({
+    left_text: " 人工智能 ",
+    right_text: " AI ",
+  });
+  expect(spaced.total_cost).toBe(100);
+
+  // 3c) A declared pair whose two sides are identical marks the equal-text
+  //     match row with that pair as its source.
+  const equalPair = await (
+    await request.post("/api/align", {
+      data: {
+        left: [{ time: 0, text: "新产品将于下月上市" }],
+        right: [{ time: 100, text: "新产品将于下月上市" }],
+        term_pairs: [
+          {
+            left_text: "新产品将于下月上市",
+            right_text: "新产品将于下月上市",
+          },
+        ],
+      },
+    })
+  ).json();
+  expect(equalPair.steps[0].term_pair).toEqual({
+    left_text: "新产品将于下月上市",
+    right_text: "新产品将于下月上市",
+  });
 
   // 4) A same-side duplicate mapping fails exactly once.
   const conflict = await request.post("/api/align", {

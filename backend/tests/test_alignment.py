@@ -798,6 +798,44 @@ def test_term_pairs_exact_hit_waives_penalty_and_tags_the_row():
     assert result["total_cost"] == 300
 
 
+def test_term_pairs_same_text_pair_marks_the_equal_text_match():
+    # A declared pair whose two sides are themselves identical is still a
+    # declared correspondence: a match of notes with that same text is an
+    # exact hit and must carry the pair as its source.
+    left = [note(0, "新产品将于下月上市"), note(9000, "结束语")]
+    right = [note(100, "新产品将于下月上市"), note(9200, "结束语")]
+    pair = ("新产品将于下月上市", "新产品将于下月上市")
+    result = align(left, right, term_pairs=[pair])
+
+    rows = result["steps"]
+    assert [s["action"] for s in rows] == ["match", "match"]
+    tagged = rows[0]
+    assert tagged["cost"] == 100
+    assert tagged["term_pair"] == {
+        "left_text": pair[0], "right_text": pair[1]
+    }
+    # An equal-text row that no pair declared keeps the plain presentation.
+    assert "term_pair" not in rows[1]
+
+
+def test_term_pairs_leading_and_trailing_spaces_are_kept_verbatim():
+    # Exact means verbatim: the declared spaces are part of the term and must
+    # neither be trimmed away nor block the exact hit.
+    left = [note(0, " 人工智能 ")]
+    right = [note(100, " AI ")]
+    result = align(
+        left, right, term_pairs=[(" 人工智能 ", " AI ")]
+    )
+    assert result["term_pairs"] == [
+        {"left_text": " 人工智能 ", "right_text": " AI "}
+    ]
+    row = result["steps"][0]
+    assert row["cost"] == 100
+    assert row["term_pair"] == {
+        "left_text": " 人工智能 ", "right_text": " AI "
+    }
+
+
 def test_term_pairs_non_hit_different_text_stays_penalized():
     left = [note(0, "x")]
     right = [note(0, "y")]
@@ -881,8 +919,9 @@ def test_term_pairs_exhaustive_against_independent_recursion():
             left, right, anchors, term_pairs
         )
 
-        # Every hit row is an exact declared pair on different texts; every
-        # other match row carries no term_pair marker.
+        # Every hit row is an exact declared pair (a declaration whose two
+        # sides are equal hits an equal-text match too); every other match row
+        # carries no term_pair marker.
         for s in result["steps"]:
             if s["action"] != "match":
                 assert "term_pair" not in s
@@ -890,13 +929,10 @@ def test_term_pairs_exhaustive_against_independent_recursion():
             lt, rt = s["left"]["text"], s["right"]["text"]
             if "term_pair" in s:
                 assert (lt, rt) in set(term_pairs)
-                assert lt != rt
                 # A tagged row's cost is exactly the time difference.
                 assert s["cost"] == abs(s["left"]["time"] - s["right"]["time"])
             else:
-                assert not (
-                    lt != rt and _synonymous(lt, rt, term_pairs)
-                )
+                assert (lt, rt) not in set(term_pairs)
         cases += 1
     assert cases == 500
 

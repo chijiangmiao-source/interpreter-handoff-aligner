@@ -539,6 +539,49 @@ def run_term_pair_checks() -> None:
         status == 200 and restored == free_body,
     )
 
+    # Guarantee 6: declared texts are kept verbatim, leading/trailing spaces
+    # included, and hit notes carrying those exact spaces.
+    spaced_terms = [{"left_text": " 人工智能 ", "right_text": " AI "}]
+    status, spaced = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            "left": [{"time": 0, "text": " 人工智能 "}],
+            "right": [{"time": 100, "text": " AI "}],
+            "term_pairs": spaced_terms,
+        },
+    )
+    check(
+        "terms: leading/trailing spaces are preserved verbatim and hit",
+        status == 200
+        and spaced.get("term_pairs") == spaced_terms
+        and spaced["steps"][0].get("term_pair") == spaced_terms[0]
+        and spaced["total_cost"] == 100,
+        f"spaced={spaced}",
+    )
+
+    # Guarantee 7: a pair whose two declared sides are themselves identical
+    # is still a declared correspondence, so the equal-text match row carries
+    # the pair as its source.
+    same_text = "新产品将于下月上市"
+    same_terms = [{"left_text": same_text, "right_text": same_text}]
+    status, marked = http(
+        "POST",
+        f"{API_URL}/api/align",
+        {
+            "left": [{"time": 0, "text": same_text}],
+            "right": [{"time": 100, "text": same_text}],
+            "term_pairs": same_terms,
+        },
+    )
+    check(
+        "terms: an equal-sided declared pair marks the same-text match row",
+        status == 200
+        and marked["steps"][0].get("term_pair") == same_terms[0]
+        and marked["total_cost"] == 100,
+        f"marked={marked}",
+    )
+
 
 def main() -> int:
     # 1. API health

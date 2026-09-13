@@ -55,7 +55,12 @@ function costExplanation(step: AlignStep): string {
   const rt = step.right!.time;
   const diff = absDiff(lt, rt);
   if (step.term_pair) {
-    return `术语等价「${step.term_pair.left_text} ≡ ${step.term_pair.right_text}」：|${n(lt)} − ${n(rt)}| = ${diff}（免除 3000）`;
+    // A declared pair whose two sides are themselves identical can hit an
+    // equal-text match; that row carries the term source but had no 3000
+    // penalty to waive in the first place.
+    const waiver =
+      step.left!.text === step.right!.text ? "" : "（免除 3000）";
+    return `术语等价「${step.term_pair.left_text} ≡ ${step.term_pair.right_text}」：|${n(lt)} − ${n(rt)}| = ${diff}${waiver}`;
   }
   const same = step.left!.text === step.right!.text;
   if (same) {
